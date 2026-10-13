@@ -1,0 +1,731 @@
+[
+    {
+        "id": "choco_flow_2026",
+        "type": "tab",
+        "label": "Tanque de Chocolate",
+        "disabled": false,
+        "info": "Monitoreo y control MQTT del tanque"
+    },
+    {
+        "id": "choco_mqtt_in_2026",
+        "type": "mqtt in",
+        "z": "choco_flow_2026",
+        "name": "Telemetría ESP32",
+        "topic": "choco_tanque/telemetria",
+        "qos": "0",
+        "datatype": "auto-detect",
+        "broker": "choco_broker_2026",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 110,
+        "y": 120,
+        "wires": [
+            [
+                "choco_process_2026",
+                "choco_watchdog_2026",
+                "choco_debug_tel_2026",
+                "choco_watchdog60_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_debug_tel_2026",
+        "type": "debug",
+        "z": "choco_flow_2026",
+        "name": "Telemetría cruda",
+        "active": true,
+        "tosidebar": false,
+        "console": false,
+        "tostatus": true,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "payload.estado",
+        "statusType": "auto",
+        "x": 390,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "choco_process_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Procesar telemetría",
+        "func": "// ===== AJUSTES DEL MODO AUTOMÁTICO (puedes cambiarlos) =====\nconst CFG = {sp: 48.0, kp: 15, ki: 0.05, kd: 5};\n// ============================================================\nflow.set('cfg', CFG);\n\nlet d = msg.payload;\nif (typeof d === 'string') {\n    try { d = JSON.parse(d); }\n    catch (e) { node.warn('Telemetría JSON inválida'); return null; }\n}\nif (!d || typeof d !== 'object') return null;\n\nconst c = Number(d.codigo_falla || 0);\nconst timeout = (c & 8) !== 0;\nflow.set('falla_timeout', timeout);\n\n// Un sensor se considera malo por el bit de falla O por lectura inválida en vivo\n// (igual que el OLED del ESP32). Con timeout de llenado se oculta el aviso de sensores.\nconst tempMal = (c & 1) !== 0 || d.temp_valida === false;\nconst nivelMal = (c & 2) !== 0 || d.nivel_valida === false;\nconst f = [];\nif (!timeout && tempMal) f.push('Sensor de temperatura inválido');\nif (!timeout && nivelMal) f.push('Sensor de nivel sin lectura válida');\nif (c & 4) f.push('Sobretemperatura del pulmón');\nif (c & 8) f.push('Timeout de llenado');\nif (c & 16) f.push('Sobretemperatura del encamisado');\nd.fallas_txt = f.join(', ');\nd.offline = false;\n\n// Alerta de nivel generada aquí en Node-RED (el ESP32 no la envía por MQTT).\n// Se emite al pasar de nivel bueno a malo, máximo 1 vez cada 30 s.\nconst alertas = [];      // avisos que se muestran en el dashboard\nconst cmdsGuard = [];    // comandos de seguridad hacia el ESP32\nconst prevMal = flow.get('nivel_mal_prev') === true;\nflow.set('nivel_mal_prev', nivelMal);\nif (nivelMal && !prevMal && !timeout) {\n    const ahoraA = Date.now();\n    if (ahoraA - (context.get('ult_alerta_nivel') || 0) > 30000) {\n        context.set('ult_alerta_nivel', ahoraA);\n        alertas.push({payload: new Date().toLocaleTimeString('es-CO') + ' · SENSOR_NIVEL_INVALIDO: Sensor de nivel sin lectura válida'});\n    }\n}\n\n// El ESP32 no informa qué botones se pidieron: Node-RED lo recuerda\nflow.set('modo_manual', d.modo_manual === true);\nlet man = flow.get('man') || {bomba:false, valvula:false, niquelina:false, agitador:false};\nif (!d.modo_manual) {\n    man = {bomba:false, valvula:false, niquelina:false, agitador:false};\n    flow.set('man', man);\n}\n// Seguridad de proceso en manual: la niquelina no puede quedar pedida con el pulmón\n// en o por encima del setpoint. Se apaga el pedido, se envía OFF y se avisa.\nif (d.modo_manual && man.niquelina && d.temp_valida === true &&\n    Number(d.temp_pulmon) >= Number(d.setpoint)) {\n    man.niquelina = false;\n    flow.set('man', man);\n    cmdsGuard.push({payload: {cmd: 'niquelina', valor: false}});\n    alertas.push({payload: new Date().toLocaleTimeString('es-CO') + ' · NIQUELINA_APAGADA: pulmón a ' +\n        Number(d.temp_pulmon).toFixed(1) + ' °C alcanzó el setpoint (' + Number(d.setpoint).toFixed(1) + ' °C)'});\n}\nd.man_bomba = man.bomba;\nd.man_valvula = man.valvula;\nd.man_niquelina = man.niquelina;\nd.man_agitador = man.agitador;\n\n// ---- Motivo por el que un equipo pedido en manual NO enciende (vacío = sin impedimento)\nconst num = x => Number(x);\nconst T = d.temp_valida === true, Nv = d.nivel_valida === true;\nconst cok = d.cargas_ok;   // true/false; undefined si el ESP32 es de la versión anterior\nconst est = d.estado;\nconst pul = num(d.temp_pulmon), enc = num(d.temp_encamisado), niv = num(d.nivel_cm), sp = num(d.setpoint);\nconst lim = sp + 4;\nconst comun = () => {\n    if (est === 'FALLA') return 'Sistema en FALLA: rearme primero';\n    if (!T) return 'Sensores de temperatura sin lectura válida';\n    if (!Nv) return 'Sensor de nivel sin lectura válida';\n    return '';\n};\nconst motivo = {bomba: '', valvula: '', niquelina: '', agitador: ''};\nif (d.modo_manual) {\n    if (man.bomba) {\n        motivo.bomba = comun()\n            || (est !== 'NORMAL' ? 'Estado ' + est + ': la bomba solo funciona en NORMAL' : '')\n            || (niv > 4 ? 'Nivel bajo (' + niv.toFixed(1) + ' cm; debe ser 4 cm o menos)' : '')\n            || (cok === false ? 'Nivel sin confirmar (necesita 5 lecturas estables de 4 cm o menos)' : '')\n            || (pul < 36 ? 'Pulmón a ' + pul.toFixed(1) + ' °C (mínimo 36 °C)' : '')\n            || (d.valvula ? 'Válvula abierta' : '')\n            || (num(d.velocidad_bomba) <= 0 ? 'Velocidad de bomba en 0 %' : '');\n        if (d.bomba) motivo.bomba = '';\n    }\n    if (man.niquelina) {\n        motivo.niquelina = comun()\n            || (est !== 'NORMAL' ? 'Estado ' + est + ': la niquelina solo funciona en NORMAL' : '')\n            || (niv > 4 ? 'Nivel bajo (' + niv.toFixed(1) + ' cm; debe ser 4 cm o menos)' : '')\n            || (cok === false ? 'Nivel sin confirmar (necesita 5 lecturas estables de 4 cm o menos)' : '')\n            || (d.valvula ? 'Válvula abierta' : '')\n            || ((pul >= lim || enc >= lim) ? 'Temperatura sobre el límite (' + lim.toFixed(0) + ' °C)' : '');\n        if (d.niquelina) motivo.niquelina = '';\n    }\n    if (man.valvula) {\n        motivo.valvula = comun()\n            || (c !== 0 ? 'Hay una falla activa' : '')\n            || (niv <= 3 ? 'Nivel alcanzado (' + niv.toFixed(1) + ' cm; ya está lleno)' : '')\n            || ((pul >= lim || enc >= lim) ? 'Temperatura sobre el límite (' + lim.toFixed(0) + ' °C)' : '');\n        if (d.valvula) motivo.valvula = '';\n    }\n    if (man.agitador) {\n        motivo.agitador = (est === 'FALLA' ? 'Sistema en FALLA: rearme primero' : '')\n            || (est === 'INIT' ? 'Estado INIT: faltan lecturas o el nivel no está confirmado' : '')\n            || (!T ? 'Sensores de temperatura sin lectura válida' : '')\n            || (!d.agitador && enc < 30 ? 'Encamisado a ' + enc.toFixed(1) + ' °C (enciende desde 30 °C)' : '');\n        if (d.agitador) motivo.agitador = '';\n    }\n}\nd.bloq_bomba = motivo.bomba;\nd.bloq_valvula = motivo.valvula;\nd.bloq_niquelina = motivo.niquelina;\nd.bloq_agitador = motivo.agitador;\n\n// Se guarda el último dato completo para mostrarlo si se pierde la comunicación\nflow.set('ultimo_d', JSON.parse(JSON.stringify(d)));\n\n// Si un sensor no tiene lectura válida (el ESP32 manda 0), se conserva la última lectura buena\nconst guardado = flow.get('ultimas_temps') || {};\nif (Number(d.temp_pulmon) > 0) guardado.p = Number(d.temp_pulmon);\nif (Number(d.temp_encamisado) > 0) guardado.e = Number(d.temp_encamisado);\nif (d.nivel_valida === true && Number(d.nivel_cm) > 0) guardado.n = Number(d.nivel_cm);\nflow.set('ultimas_temps', guardado);\n\n// Guardián: en automático el setpoint es siempre CFG.sp y el PID usa CFG\nlet cmds = null;\nif (!d.modo_manual) {\n    const ahora = Date.now();\n    if (ahora - (context.get('ult') || 0) > 5000) {\n        const out = [];\n        if (Math.abs(Number(d.setpoint) - CFG.sp) > 0.05) {\n            out.push({payload: {cmd: 'setpoint', valor: CFG.sp}});\n        }\n        if (Math.abs(Number(d.kp) - CFG.kp) > 0.006 ||\n            Math.abs(Number(d.ki) - CFG.ki) > 0.006 ||\n            Math.abs(Number(d.kd) - CFG.kd) > 0.006) {\n            out.push({payload: {cmd: 'pid', kp: CFG.kp, ki: CFG.ki, kd: CFG.kd}});\n        }\n        if (out.length) { context.set('ult', ahora); cmds = out; }\n    }\n}\n\n// Tras una caída de más de 60 s los botones se apagaron en pantalla; al volver la\n// comunicación se apagan también los pedidos manuales que hayan quedado en el ESP32.\nif (flow.get('resync') === true) {\n    flow.set('resync', false);\n    if (d.modo_manual) {\n        const off = ['bomba', 'valvula', 'niquelina', 'agitador']\n            .map(k => ({payload: {cmd: k, valor: false}}));\n        cmds = (cmds || []).concat(off);\n    }\n}\n\nif (cmdsGuard.length) cmds = (cmds || []).concat(cmdsGuard);\n\nreturn [\n  {payload: guardado.p !== undefined ? guardado.p : 0},\n  {payload: guardado.e !== undefined ? guardado.e : 0},\n  {payload: guardado.n !== undefined ? guardado.n : 0},\n  {payload: Number(d.pid_pct || 0)},\n  {payload: d},\n  cmds,\n  alertas.length ? alertas : null\n];",
+        "outputs": 7,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 390,
+        "y": 140,
+        "wires": [
+            [
+                "choco_g_temp_p_2026"
+            ],
+            [
+                "choco_g_temp_e_2026"
+            ],
+            [
+                "choco_g_nivel_2026"
+            ],
+            [
+                "choco_g_pid_2026"
+            ],
+            [
+                "choco_tpl_mon_2026",
+                "choco_tpl_ctrl_2026"
+            ],
+            [
+                "choco_prepare_cmd_2026"
+            ],
+            [
+                "choco_alert_text_2026",
+                "choco_alert_toast_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_watchdog_2026",
+        "type": "trigger",
+        "z": "choco_flow_2026",
+        "name": "Sin datos por 30 s",
+        "op1": "",
+        "op2": "OFFLINE",
+        "op1type": "nul",
+        "op2type": "str",
+        "duration": "30",
+        "extend": true,
+        "overrideDelay": false,
+        "units": "s",
+        "reset": "",
+        "bytopic": "all",
+        "topic": "topic",
+        "outputs": 1,
+        "x": 390,
+        "y": 260,
+        "wires": [
+            [
+                "choco_offline_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_offline_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Marcar sin conexión",
+        "func": "// 30 s sin telemetría: banner de sin conexión y panel atenuado (los medidores se conservan)\nconst ultimo = flow.get('ultimo_d') || {};\nconst d = Object.assign({}, ultimo, {offline: true, estado: 'SIN CONEXIÓN', fallas_txt: ''});\nreturn [null, null, null, null, {payload: d}];",
+        "outputs": 5,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 620,
+        "y": 260,
+        "wires": [
+            [
+                "choco_g_temp_p_2026"
+            ],
+            [
+                "choco_g_temp_e_2026"
+            ],
+            [
+                "choco_g_nivel_2026"
+            ],
+            [
+                "choco_g_pid_2026"
+            ],
+            [
+                "choco_tpl_mon_2026",
+                "choco_tpl_ctrl_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_g_temp_p_2026",
+        "type": "ui_gauge",
+        "z": "choco_flow_2026",
+        "name": "Temperatura pulmón",
+        "group": "choco_grp_gauges_2026",
+        "order": 1,
+        "width": 3,
+        "height": 3,
+        "gtype": "gage",
+        "title": "Temperatura pulmón",
+        "label": "°C",
+        "format": "{{value | number:1}}",
+        "min": 0,
+        "max": "60",
+        "colors": [
+            "#42a5f5",
+            "#43a047",
+            "#e53935"
+        ],
+        "seg1": "46",
+        "seg2": 50,
+        "diff": false,
+        "className": "",
+        "x": 1080,
+        "y": 40,
+        "wires": []
+    },
+    {
+        "id": "choco_g_temp_e_2026",
+        "type": "ui_gauge",
+        "z": "choco_flow_2026",
+        "name": "Temperatura encamisado",
+        "group": "choco_grp_gauges_2026",
+        "order": 2,
+        "width": 3,
+        "height": 3,
+        "gtype": "gage",
+        "title": "Temp encamisado",
+        "label": "°C",
+        "format": "{{value | number:1}}",
+        "min": 0,
+        "max": "60",
+        "colors": [
+            "#42a5f5",
+            "#43a047",
+            "#e53935"
+        ],
+        "seg1": "42",
+        "seg2": "48",
+        "diff": false,
+        "className": "",
+        "x": 1090,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "choco_g_nivel_2026",
+        "type": "ui_gauge",
+        "z": "choco_flow_2026",
+        "name": "Distancia al líquido",
+        "group": "choco_grp_gauges_2026",
+        "order": 3,
+        "width": 3,
+        "height": 3,
+        "gtype": "gage",
+        "title": "Distancia al liquido",
+        "label": "cm",
+        "format": "{{value | number:1}}",
+        "min": 0,
+        "max": "10",
+        "colors": [
+            "#ca3838",
+            "#43a047",
+            "#ca3838"
+        ],
+        "seg1": "1",
+        "seg2": 4,
+        "diff": false,
+        "className": "",
+        "x": 1070,
+        "y": 120,
+        "wires": []
+    },
+    {
+        "id": "choco_g_pid_2026",
+        "type": "ui_gauge",
+        "z": "choco_flow_2026",
+        "name": "Salida PID",
+        "group": "choco_grp_gauges_2026",
+        "order": 4,
+        "width": 3,
+        "height": 3,
+        "gtype": "gage",
+        "title": "Resistencia salida PID",
+        "label": "%",
+        "format": "{{value | number:1}}",
+        "min": 0,
+        "max": 100,
+        "colors": [
+            "#00b500",
+            "#e6e600",
+            "#ca3838"
+        ],
+        "seg1": "",
+        "seg2": "",
+        "diff": false,
+        "className": "",
+        "x": 1050,
+        "y": 160,
+        "wires": []
+    },
+    {
+        "id": "choco_tpl_mon_2026",
+        "type": "ui_template",
+        "z": "choco_flow_2026",
+        "group": "choco_grp_mon_2026",
+        "name": "Panel de estado",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "format": "<style>\n.pn{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;width:100%}\n.pn .c{border-radius:10px;padding:8px 12px;background:#eceff1;color:#455a64;line-height:1.3}\n.pn .c small{display:block;font-size:11px;letter-spacing:.6px;text-transform:uppercase;opacity:.75}\n.pn .c b{font-size:16px}\n.pn .full{grid-column:1/-1}\n.pn .on{background:#2e7d32;color:#fff}\n.pn .info{background:#1976d2;color:#fff}\n.pn .bad{background:#c62828;color:#fff}\n.pn .good{background:#e8f5e9;color:#1b5e20}\n.pn.off .c{opacity:.55}\n</style>\n<div class=\"pn\" ng-class=\"{off: msg.payload.offline}\">\n  <div class=\"c full bad\" ng-if=\"msg.payload.offline\" style=\"opacity:1\"><b>⚠ SIN CONEXIÓN CON EL ESP32</b></div>\n  <div class=\"c\" ng-class=\"{on: msg.payload.estado=='NORMAL', info: msg.payload.estado=='RELLENO', bad: msg.payload.estado=='FALLA'}\">\n    <small>Estado</small><b>{{msg.payload.estado || '--'}}</b></div>\n  <div class=\"c\" ng-class=\"{on: msg.payload.estado && !msg.payload.offline}\">\n    <small>Modo</small><b>{{msg.payload.offline ? '--' : (msg.payload.modo_manual ? 'MANUAL' : 'AUTOMÁTICO')}}</b></div>\n  <div class=\"c full\" ng-if=\"!msg.payload.offline\" ng-class=\"msg.payload.fallas_txt ? 'bad' : 'good'\">\n    <small>Fallas</small><b>{{msg.payload.fallas_txt || 'Sin fallas'}}</b></div>\n  <div class=\"c\" ng-class=\"{on: msg.payload.bomba}\">\n    <small>Bomba</small><b>{{msg.payload.bomba ? 'ENCENDIDA' : 'APAGADA'}}</b></div>\n  <div class=\"c\" ng-class=\"{on: msg.payload.valvula}\">\n    <small>Válvula</small><b>{{msg.payload.valvula ? 'ABIERTA' : 'CERRADA'}}</b></div>\n  <div class=\"c\" ng-class=\"{on: msg.payload.niquelina}\">\n    <small>Niquelina</small><b>{{msg.payload.niquelina ? 'ENCENDIDA' : 'APAGADA'}}</b></div>\n  <div class=\"c\" ng-class=\"{on: msg.payload.agitador}\">\n    <small>Agitador</small><b>{{msg.payload.agitador ? 'ENCENDIDO' : 'APAGADO'}}</b></div>\n  <div class=\"c\" ng-class=\"{good: msg.payload.temp_valida, bad: msg.payload.temp_valida===false}\">\n    <small>Sensores de temperatura</small><b>{{msg.payload.temp_valida ? 'VÁLIDOS' : (msg.payload.temp_valida===false ? 'INVÁLIDOS' : '--')}}</b></div>\n  <div class=\"c\" ng-class=\"{good: msg.payload.nivel_valida, bad: msg.payload.nivel_valida===false}\">\n    <small>Sensor de nivel</small><b>{{msg.payload.nivel_valida ? 'VÁLIDO' : (msg.payload.nivel_valida===false ? 'INVÁLIDO' : '--')}}</b></div>\n  <div class=\"c\" ng-class=\"{good: msg.payload.nivel_valida, bad: msg.payload.nivel_valida===false}\">\n    <small>Distancia al líquido</small><b>{{msg.payload.nivel_valida ? (msg.payload.nivel_cm + ' cm') : '--'}}</b></div>\n  <div class=\"c\">\n    <small>Setpoint</small><b>{{msg.payload.setpoint ? (msg.payload.setpoint + ' °C') : '--'}}</b></div>\n  <div class=\"c\">\n    <small>Velocidad de bomba</small><b>{{msg.payload.offline ? '--' : (msg.payload.velocidad_bomba + ' %')}}</b></div>\n</div>",
+        "storeOutMessages": false,
+        "fwdInMessages": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1060,
+        "y": 260,
+        "wires": [
+            []
+        ]
+    },
+    {
+        "id": "choco_alert_in_2026",
+        "type": "mqtt in",
+        "z": "choco_flow_2026",
+        "name": "Alertas ESP32",
+        "topic": "choco_tanque/alertas",
+        "qos": "0",
+        "datatype": "auto-detect",
+        "broker": "choco_broker_2026",
+        "nl": false,
+        "rap": true,
+        "rh": 0,
+        "inputs": 0,
+        "x": 1060,
+        "y": 520,
+        "wires": [
+            [
+                "choco_alert_process_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_alert_process_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Mostrar alerta",
+        "func": "let a = msg.payload;\nif (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { a = {mensaje: a}; } }\na = a || {};\nconst tipo = a.tipo || 'ALERTA';\n\n// Solo se muestran estas alertas\nconst permitidas = [\n    'SENSOR_TEMP_INVALIDO',\n    'SOBRETEMPERATURA',\n    'SOBRETEMPERATURA_ENCAMISADO',\n    'NIVEL_BAJO',\n    'TIMEOUT_LLENADO',\n    'COMANDO_INVALIDO',\n    'REARME_SOLICITADO',\n    'REARME_RECHAZADO'\n];\nif (!permitidas.includes(tipo)) return null;\n\n// Con falla por timeout de llenado no se muestra el aviso de sensor de temperatura\nif (tipo === 'SENSOR_TEMP_INVALIDO' && flow.get('falla_timeout') === true) return null;\n\n// NIVEL_BAJO se muestra como máximo 1 vez cada 2 minutos\nif (tipo === 'NIVEL_BAJO') {\n    const ult = context.get('ult') || 0;\n    const ahora = Date.now();\n    if (ahora - ult < 120000) return null;\n    context.set('ult', ahora);\n}\n\nconst hora = new Date().toLocaleTimeString('es-CO');\nmsg.payload = hora + ' · ' + tipo + ': ' + (a.mensaje || '');\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1320,
+        "y": 520,
+        "wires": [
+            [
+                "choco_alert_text_2026",
+                "choco_alert_toast_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_alert_text_2026",
+        "type": "ui_text",
+        "z": "choco_flow_2026",
+        "group": "choco_grp_alert_2026",
+        "order": 1,
+        "width": 12,
+        "height": 1,
+        "name": "Última alerta",
+        "label": "Última alerta",
+        "format": "<b style='color:#c62828'>{{msg.payload}}</b>",
+        "layout": "col-center",
+        "className": "",
+        "style": false,
+        "font": "",
+        "fontSize": "",
+        "color": "#000000",
+        "x": 1770,
+        "y": 520,
+        "wires": []
+    },
+    {
+        "id": "choco_alert_toast_2026",
+        "type": "ui_toast",
+        "z": "choco_flow_2026",
+        "position": "top right",
+        "displayTime": "8",
+        "highlight": "red",
+        "sendall": true,
+        "outputs": 0,
+        "ok": "OK",
+        "cancel": "",
+        "raw": false,
+        "className": "",
+        "topic": "",
+        "name": "Aviso de alerta",
+        "x": 1760,
+        "y": 260,
+        "wires": []
+    },
+    {
+        "id": "choco_tpl_ctrl_2026",
+        "type": "ui_template",
+        "z": "choco_flow_2026",
+        "group": "choco_grp_ctrl_2026",
+        "name": "Botones de control",
+        "order": 1,
+        "width": 0,
+        "height": 0,
+        "format": "<style>\n.ct{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%}\n.ct button{width:100%;border:0;border-radius:8px;padding:13px 6px;font-weight:600;font-size:13px;letter-spacing:.5px;color:#fff;background:#9e9e9e;cursor:pointer;transition:background .2s}\n.ct button.on{background:#2e7d32}\n.ct button.bad{background:#c62828}\n.ct button.rearm{background:#6d4c41;grid-column:1/-1}\n.ct button.rearm:not(:disabled){background:#c62828}\n.ct button:disabled{opacity:.4;cursor:not-allowed}\n.ct .bw{display:flex;flex-direction:column}\n.ct .why{font-size:11px;color:#c62828;margin:3px 2px 0;line-height:1.25}\n.ct .offb{grid-column:1/-1;background:#c62828;color:#fff;border-radius:10px;padding:10px 12px;font-weight:700;text-align:center}\n.ct .offb small{display:block;font-weight:400;font-size:12px;margin-top:2px}\n</style>\n<div class=\"ct\">\n  <div class=\"offb\" ng-if=\"msg.payload.offline\">⚠ SIN CONEXIÓN CON EL ESP32\n    <small ng-if=\"msg.payload.controles_apagados\">Controles apagados por falta de comunicación</small></div>\n  <button ng-disabled=\"msg.payload.offline\" ng-class=\"{on: msg.payload.modo_manual===true}\" ng-click=\"send({payload:{cmd:'modo',valor:'manual'}})\">MODO MANUAL</button>\n  <button ng-disabled=\"msg.payload.offline\" ng-class=\"{on: msg.payload.modo_manual===false}\" ng-click=\"send({payload:{cmd:'modo',valor:'automatico'}})\">MODO AUTOMÁTICO</button>\n\n  <div class=\"bw\">\n    <button ng-disabled=\"!msg.payload.modo_manual || msg.payload.offline\"\n            ng-class=\"{on: msg.payload.man_valvula && !msg.payload.bloq_valvula, bad: msg.payload.man_valvula && msg.payload.bloq_valvula}\"\n            ng-click=\"send({payload:{cmd:'valvula',valor:!msg.payload.man_valvula}})\">VÁLVULA: {{msg.payload.man_valvula ? 'ABIERTA' : 'CERRADA'}}</button>\n    <div class=\"why\" ng-if=\"msg.payload.man_valvula && msg.payload.bloq_valvula\">No enciende: {{msg.payload.bloq_valvula}}</div>\n  </div>\n  <div class=\"bw\">\n    <button ng-disabled=\"!msg.payload.modo_manual || msg.payload.offline\"\n            ng-class=\"{on: msg.payload.man_bomba && !msg.payload.bloq_bomba, bad: msg.payload.man_bomba && msg.payload.bloq_bomba}\"\n            ng-click=\"send({payload:{cmd:'bomba',valor:!msg.payload.man_bomba}})\">BOMBA: {{msg.payload.man_bomba ? 'ON' : 'OFF'}}</button>\n    <div class=\"why\" ng-if=\"msg.payload.man_bomba && msg.payload.bloq_bomba\">No enciende: {{msg.payload.bloq_bomba}}</div>\n  </div>\n  <div class=\"bw\">\n    <button ng-disabled=\"!msg.payload.modo_manual || msg.payload.offline\"\n            ng-class=\"{on: msg.payload.man_niquelina && !msg.payload.bloq_niquelina, bad: msg.payload.man_niquelina && msg.payload.bloq_niquelina}\"\n            ng-click=\"send({payload:{cmd:'niquelina',valor:!msg.payload.man_niquelina}})\">NIQUELINA: {{msg.payload.man_niquelina ? 'ON' : 'OFF'}}</button>\n    <div class=\"why\" ng-if=\"msg.payload.man_niquelina && msg.payload.bloq_niquelina\">No enciende: {{msg.payload.bloq_niquelina}}</div>\n  </div>\n  <div class=\"bw\">\n    <button ng-disabled=\"!msg.payload.modo_manual || msg.payload.offline\"\n            ng-class=\"{on: msg.payload.man_agitador && !msg.payload.bloq_agitador, bad: msg.payload.man_agitador && msg.payload.bloq_agitador}\"\n            ng-click=\"send({payload:{cmd:'agitador',valor:!msg.payload.man_agitador}})\">AGITADOR: {{msg.payload.man_agitador ? 'ON' : 'OFF'}}</button>\n    <div class=\"why\" ng-if=\"msg.payload.man_agitador && msg.payload.bloq_agitador\">No enciende: {{msg.payload.bloq_agitador}}</div>\n  </div>\n\n  <button class=\"rearm\" ng-disabled=\"msg.payload.estado!='FALLA'\" ng-click=\"send({payload:{cmd:'reset_falla'}})\">REARMAR FALLA</button>\n</div>",
+        "storeOutMessages": false,
+        "fwdInMessages": false,
+        "resendOnRefresh": true,
+        "templateScope": "local",
+        "className": "",
+        "x": 1070,
+        "y": 300,
+        "wires": [
+            [
+                "choco_ctrl_logic_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_ctrl_logic_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Lógica de control",
+        "func": "const c = msg.payload;\nif (!c || typeof c !== 'object') return null;\n\nconst cfg = flow.get('cfg') || {sp: 48, kp: 15, ki: 0.05, kd: 5};\nconst manual = flow.get('modo_manual') === true;\nconst vacio = {bomba:false, valvula:false, niquelina:false, agitador:false};\nconst m = x => ({payload: x});\n// Salida 1: comandos hacia el ESP32.  Salida 2: avisos al dashboard.\n\nif (c.cmd === 'modo') {\n    flow.set('man', Object.assign({}, vacio));\n    if (c.valor === 'manual') {\n        // Entra a manual con todo apagado\n        return [[m({cmd:'bomba', valor:false}), m({cmd:'valvula', valor:false}),\n                 m({cmd:'niquelina', valor:false}), m({cmd:'agitador', valor:false}), m(c)], null];\n    }\n    // Automático: modo + setpoint fijo + PID suave\n    return [[m(c), m({cmd:'setpoint', valor:cfg.sp}),\n             m({cmd:'pid', kp:cfg.kp, ki:cfg.ki, kd:cfg.kd})], null];\n}\n\nif (['bomba', 'valvula', 'niquelina', 'agitador'].includes(c.cmd)) {\n    if (!manual) return null;          // solo se accionan en modo manual\n\n    // La niquelina no se enciende si el pulmón ya está en o sobre el setpoint\n    if (c.cmd === 'niquelina' && c.valor === true) {\n        const u = flow.get('ultimo_d') || {};\n        const pul = Number(u.temp_pulmon), sp = Number(u.setpoint);\n        if (u.temp_valida === true && Number.isFinite(pul) && Number.isFinite(sp) && pul >= sp) {\n            const hora = new Date().toLocaleTimeString('es-CO');\n            return [null, m(hora + ' · NIQUELINA_BLOQUEADA: pulmón a ' + pul.toFixed(1) +\n                ' °C, por encima del setpoint (' + sp.toFixed(1) + ' °C)')];\n        }\n    }\n\n    const man = flow.get('man') || Object.assign({}, vacio);\n    man[c.cmd] = c.valor === true;\n    flow.set('man', man);\n    return [m(c), null];\n}\n\nif (c.cmd === 'setpoint') return manual ? [m(c), null] : null;   // en automático es fijo\n\nreturn [m(c), null];",
+        "outputs": 2,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1430,
+        "y": 300,
+        "wires": [
+            [
+                "choco_prepare_cmd_2026"
+            ],
+            [
+                "choco_alert_text_2026",
+                "choco_alert_toast_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_setpoint_in_2026",
+        "type": "ui_numeric",
+        "z": "choco_flow_2026",
+        "name": "Setpoint",
+        "label": "Setpoint °C (solo manual)",
+        "tooltip": "En automático el setpoint es siempre 48 °C. El ESP32 limita el valor entre 40 y 55 °C.",
+        "group": "choco_grp_set_2026",
+        "order": 1,
+        "width": 12,
+        "height": 1,
+        "wrap": false,
+        "passthru": false,
+        "topic": "",
+        "topicType": "str",
+        "format": "{{value}}",
+        "min": 40,
+        "max": 55,
+        "step": 0.5,
+        "className": "",
+        "x": 860,
+        "y": 380,
+        "wires": [
+            [
+                "choco_make_setpoint_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_make_setpoint_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Preparar setpoint",
+        "func": "const n = Number(msg.payload);\nif (!Number.isFinite(n)) return null;\nmsg.payload = {cmd:'setpoint', valor:n};\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1070,
+        "y": 380,
+        "wires": [
+            [
+                "choco_ctrl_logic_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_speed_in_2026",
+        "type": "ui_slider",
+        "z": "choco_flow_2026",
+        "name": "Velocidad bomba",
+        "label": "Velocidad de bomba %",
+        "tooltip": "",
+        "group": "choco_grp_set_2026",
+        "order": 2,
+        "width": 12,
+        "height": 1,
+        "passthru": false,
+        "outs": "end",
+        "topic": "",
+        "topicType": "str",
+        "min": 0,
+        "max": 100,
+        "step": 5,
+        "className": "",
+        "x": 1070,
+        "y": 440,
+        "wires": [
+            [
+                "choco_make_speed_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_make_speed_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Preparar velocidad",
+        "func": "const n = Number(msg.payload);\nif (!Number.isFinite(n)) return null;\nmsg.payload = {cmd:'velocidad_bomba', valor:n};\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1330,
+        "y": 440,
+        "wires": [
+            [
+                "choco_prepare_cmd_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_prepare_cmd_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Preparar comando",
+        "func": "let p = msg.payload;\nif (typeof p === 'string') { try { p = JSON.parse(p); } catch(e) { node.warn('Comando JSON inválido'); return null; } }\nif (!p || typeof p !== 'object') return null;\nmsg.topic = 'choco_tanque/comandos';\nmsg.payload = JSON.stringify(p);\nreturn msg;",
+        "outputs": 1,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 1070,
+        "y": 200,
+        "wires": [
+            [
+                "choco_mqtt_out_2026",
+                "choco_debug_cmd_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_mqtt_out_2026",
+        "type": "mqtt out",
+        "z": "choco_flow_2026",
+        "name": "Comandos al ESP32",
+        "topic": "choco_tanque/comandos",
+        "qos": "0",
+        "retain": "false",
+        "respTopic": "",
+        "contentType": "",
+        "userProps": "",
+        "correl": "",
+        "expiry": "",
+        "broker": "choco_broker_2026",
+        "x": 1420,
+        "y": 200,
+        "wires": []
+    },
+    {
+        "id": "choco_debug_cmd_2026",
+        "type": "debug",
+        "z": "choco_flow_2026",
+        "name": "Comando enviado",
+        "active": true,
+        "tosidebar": true,
+        "console": false,
+        "tostatus": false,
+        "complete": "payload",
+        "targetType": "msg",
+        "statusVal": "",
+        "statusType": "auto",
+        "x": 1410,
+        "y": 160,
+        "wires": []
+    },
+    {
+        "id": "choco_watchdog60_2026",
+        "type": "trigger",
+        "z": "choco_flow_2026",
+        "name": "Sin datos por 60 s",
+        "op1": "",
+        "op2": "OFFLINE",
+        "op1type": "nul",
+        "op2type": "str",
+        "duration": "60",
+        "extend": true,
+        "overrideDelay": false,
+        "units": "s",
+        "reset": "",
+        "bytopic": "all",
+        "topic": "topic",
+        "outputs": 1,
+        "x": 390,
+        "y": 360,
+        "wires": [
+            [
+                "choco_zero_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_zero_2026",
+        "type": "function",
+        "z": "choco_flow_2026",
+        "name": "Sin conexión 60 s",
+        "func": "// 60 s sin telemetría: medidores a 0, botones apagados y pedidos manuales en OFF\nconst vacio = {bomba:false, valvula:false, niquelina:false, agitador:false};\nflow.set('man', Object.assign({}, vacio));\nflow.set('modo_manual', false);\nflow.set('resync', true);   // al volver la comunicación se re-sincroniza el ESP32\n\nconst ultimo = flow.get('ultimo_d') || {};\nconst d = Object.assign({}, ultimo, {\n    offline: true,\n    controles_apagados: true,\n    estado: 'SIN CONEXIÓN',\n    fallas_txt: '',\n    modo_manual: null,   // ningún botón de modo queda en verde\n    man_bomba: false, man_valvula: false, man_niquelina: false, man_agitador: false,\n    bloq_bomba: '', bloq_valvula: '', bloq_niquelina: '', bloq_agitador: ''\n});\nflow.set('ultimo_d', d);\n\n// Mejor esfuerzo: pedir OFF a los equipos manuales (si el ESP32 aún recibe comandos)\nconst off = ['bomba', 'valvula', 'niquelina', 'agitador']\n    .map(k => ({payload: {cmd: k, valor: false}}));\n\nreturn [{payload: 0}, {payload: 0}, {payload: 0}, {payload: 0}, {payload: d}, off];",
+        "outputs": 6,
+        "timeout": 0,
+        "noerr": 0,
+        "initialize": "",
+        "finalize": "",
+        "libs": [],
+        "x": 610,
+        "y": 360,
+        "wires": [
+            [
+                "choco_g_temp_p_2026"
+            ],
+            [
+                "choco_g_temp_e_2026"
+            ],
+            [
+                "choco_g_nivel_2026"
+            ],
+            [
+                "choco_g_pid_2026"
+            ],
+            [
+                "choco_tpl_mon_2026",
+                "choco_tpl_ctrl_2026"
+            ],
+            [
+                "choco_prepare_cmd_2026"
+            ]
+        ]
+    },
+    {
+        "id": "choco_broker_2026",
+        "type": "mqtt-broker",
+        "name": "HiveMQ tanque",
+        "broker": "broker.hivemq.com",
+        "port": "1883",
+        "clientid": "",
+        "autoConnect": true,
+        "usetls": false,
+        "protocolVersion": "4",
+        "keepalive": "30",
+        "cleansession": true,
+        "autoUnsubscribe": true,
+        "birthTopic": "",
+        "birthQos": "0",
+        "birthPayload": "",
+        "birthMsg": {},
+        "closeTopic": "",
+        "closeQos": "0",
+        "closePayload": "",
+        "closeMsg": {},
+        "willTopic": "",
+        "willQos": "0",
+        "willPayload": "",
+        "willMsg": {},
+        "userProps": "",
+        "sessionExpiry": ""
+    },
+    {
+        "id": "choco_grp_gauges_2026",
+        "type": "ui_group",
+        "name": "Temperaturas y nivel",
+        "tab": "choco_ui_tab_mon_2026",
+        "order": 1,
+        "disp": true,
+        "width": "12",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "choco_grp_mon_2026",
+        "type": "ui_group",
+        "name": "Estado del sistema",
+        "tab": "choco_ui_tab_mon_2026",
+        "order": 2,
+        "disp": true,
+        "width": "12",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "choco_grp_alert_2026",
+        "type": "ui_group",
+        "name": "Alertas",
+        "tab": "choco_ui_tab_mon_2026",
+        "order": 3,
+        "disp": true,
+        "width": "12",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "choco_grp_ctrl_2026",
+        "type": "ui_group",
+        "name": "Operación",
+        "tab": "choco_ui_tab_ctrl_2026",
+        "order": 1,
+        "disp": true,
+        "width": "12",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "choco_grp_set_2026",
+        "type": "ui_group",
+        "name": "Ajustes",
+        "tab": "choco_ui_tab_ctrl_2026",
+        "order": 2,
+        "disp": true,
+        "width": "12",
+        "collapse": false,
+        "className": ""
+    },
+    {
+        "id": "choco_ui_tab_mon_2026",
+        "type": "ui_tab",
+        "name": "Tanque · Monitoreo",
+        "icon": "dashboard",
+        "order": 1,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "choco_ui_tab_ctrl_2026",
+        "type": "ui_tab",
+        "name": "Tanque · Control",
+        "icon": "settings_remote",
+        "order": 2,
+        "disabled": false,
+        "hidden": false
+    },
+    {
+        "id": "87e803c2e4beaa97",
+        "type": "global-config",
+        "env": [],
+        "modules": {
+            "node-red-dashboard": "3.6.6"
+        }
+    }
+]
