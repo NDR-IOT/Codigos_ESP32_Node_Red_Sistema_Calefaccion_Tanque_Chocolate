@@ -1,0 +1,2087 @@
+/*
+ * ============================================================================
+ * SISTEMA MECATRONICO: TANQUE DE CHOCOLATE
+ * ============================================================================
+ *
+ * ORGANIZACION GENERAL
+ *
+ * 1. El lazo principal loop() realiza el control del tanque:
+ *    - Lee temperaturas y nivel.
+ *    - Evalua seguridad.
+ *    - Decide el estado del proceso.
+ *    - Controla bomba, resistencia, valvula y agitador.
+ *    - Actualiza OLED, buzzer y monitor serial.
+ *
+ * 2. tareaRed() se crea en el nucleo 0:
+ *    - Mantiene WiFi y MQTT.
+ *    - Recibe comandos y los coloca en una cola.
+ *    - Publica alertas y telemetria.
+ *    - Actualiza un diagnostico compartido con el control.
+ *
+ * IMPORTANTE
+ *
+ * - El nivel es DISTANCIA entre sensor y liquido, no altura del liquido.
+ *   Mayor distancia significa menos liquido.
+ *
+ * - El modo manual NO elimina los interbloqueos de seguridad.
+ *
+ * - Los indicadores de salidas muestran lo que aplica el programa.
+ *   No hay sensores que confirmen que los actuadores funcionen fisicamente.
+ *
+ * - MQTT conectado no significa que el dashboard reciba los datos.
+ *   OK_LOCAL indica exito local de publish(), no recepcion en el dashboard.
+ *
+ */
+
+// ============================================================================
+// 1. LIBRERIAS
+// ============================================================================
+
+#include <WiFi.h>               // Conexion del ESP32 a WiFi.
+#include <PubSubClient.h>       // Cliente MQTT: conectar, publicar y suscribirse.
+#include <OneWire.h>            // Comunicacion con sensores por bus OneWire.
+#include <DallasTemperature.h>  // Manejo de los sensores de temperatura DS18B20.
+#include <ArduinoJson.h>        // Interpretacion de comandos recibidos en JSON.
+#include <Wire.h>               // Comunicacion I2C de la pantalla OLED.
+#include <Adafruit_GFX.h>       // Funciones graficas para la pantalla.
+#include <Adafruit_SSD1306.h>   // Controlador de la pantalla OLED SSD1306.
+#include <math.h>               // NAN, fabsf() y roundf().
+#include <esp_task_wdt.h>       // Watchdog: supervision del lazo de control.
+#include <freertos/FreeRTOS.h>  // Base de FreeRTOS.
+#include <freertos/task.h>      // Creacion y pausas de tareas.
+#include <freertos/queue.h>     // Colas para alertas y comandos.
+#include <freertos/semphr.h>    // Mutex para proteger el buffer de telemetria.
+
+// ============================================================================
+// 2. CONFIGURACION DE WIFI Y MQTT
+// ============================================================================
+
+const char* WIFI_SSID = "NIXON";
+const char* WIFI_PASS = "CONTRASEÑA_WIFI";
+const char* MQTT_SERVER = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+
+// Un topic es el nombre del canal MQTT.
+// TELEMETRIA: datos periodicos del tanque.
+// ALERTAS: eventos y avisos del proceso.
+// COMANDOS: ordenes que el ESP32 escucha.
+const char* TOPIC_TELEMETRIA = "choco_tanque/telemetria";
+const char* TOPIC_ALERTAS = "choco_tanque/alertas";
+const char* TOPIC_COMANDOS = "choco_tanque/comandos";
+
+// ============================================================================
+// 3. PINES DEL HARDWARE
+// ============================================================================
+
+// Cada DS18B20 tiene su propio bus OneWire.
+#define PIN_ONEWIRE_PULMON      32
+#define PIN_ONEWIRE_ENCAMISADO  33
+
+// Sensor ultrasonico de nivel.
+// TRIG: envia el pulso de medicion.
+// ECHO: recibe el pulso cuya duracion se convierte a distancia.
+#define PIN_TRIG                19
+#define PIN_ECHO                18
+
+// Salidas de actuadores.
+#define PIN_RELAY_HEATER        25
+#define PIN_RELAY_VALVE         26
+#define PIN_PUMP_PWM             4
+#define PIN_RELAY_AGITADOR      27
+
+// Indicadores y aviso sonoro.
+#define PIN_LED_WIFI             2
+#define PIN_LED_BOMBA           15
+#define PIN_LED_NIQUELINA       21
+#define PIN_LED_VALVULA         16
+#define PIN_LED_AGITADOR        17
+#define PIN_BUZZER               5
+
+// Bus I2C de la pantalla OLED.
+#define PIN_OLED_SDA            13
+#define PIN_OLED_SCL            14
+
+// Valvula y agitador: reles activos con nivel LOW.
+const uint8_t RELAY_ON = LOW;
+const uint8_t RELAY_OFF = HIGH;
+
+// Resistencia: su SSR se activa con nivel HIGH.
+const uint8_t SSR_HEATER_ON = HIGH;
+const uint8_t SSR_HEATER_OFF = LOW;
+
+// PWM electrico de la bomba.
+// Resolucion de 8 bits: valores de salida desde 0 hasta 255.
+//
+// No confundir:
+// - PWM de bomba: regula el ciclo de trabajo electrico.
+// - BOMBA_ON_MS/OFF_MS: alternan periodos de funcionamiento y pausa.
+// - PWM termico: alterna la resistencia en ventanas de tiempo.
+#define PWM_CHANNEL    0
+#define PWM_FREQ_HZ    5000
+#define PWM_RES_BITS   8
+
+// ============================================================================
+// 4. PARAMETROS AJUSTABLES DEL PROCESO
+// ============================================================================
+
+// Temperatura objetivo del pulmon.
+float setpoint = 48.0f;
+
+// Limites aceptados para cambios del setpoint por comandos.
+const float SETPOINT_MIN = 40.0f;
+const float SETPOINT_MAX = 55.0f;
+
+// Corte por sobretemperatura: setpoint + 4 grados.
+// Con setpoint de 48: corte a partir de 52 grados.
+// Para rearme se exige temperatura menor que setpoint + 3 grados.
+// Con setpoint de 48: debe estar por debajo de 51 grados.
+const float MARGEN_SOBRETEMP_C = 4.0f;
+const float MARGEN_REARME_C = 3.0f;
+
+// Distancias de nivel.
+// Mas de 4 cm: puede iniciar la secuencia de llenado.
+// Hasta 3 cm: termina un llenado activo.
+// Hasta 4 cm: condicion de distancia necesaria para bomba y resistencia.
+// Los umbrales deben corresponder a la geometria real del tanque.
+const float DISTANCIA_INICIO_LLENADO_CM = 4.0f;
+const float DISTANCIA_FIN_LLENADO_CM = 3.0f;
+const float DISTANCIA_MAX_CARGAS_CM = 4.0f;
+
+// Permiso de nivel para bomba y resistencia:
+// - Cinco lecturas consecutivas de distancia <= 4 cm.
+// - Ventana completa de cinco lecturas validas.
+// - Diferencia entre maxima y minima <= 2 cm.
+// NIVEL_MUESTRAS no debe superar la capacidad de nivelMuestras[5].
+const int NIVEL_CONFIRMACIONES_CARGAS = 5;
+const int NIVEL_MUESTRAS = 5;
+const float NIVEL_DISPERSION_MAX_CM = 2.0f;
+
+// Espera previa a activar el llenado: 2 segundos.
+// Tiempo maximo desde que se activa el llenado: 60 segundos.
+const unsigned long ESPERA_VALVULA_MS = 2000UL;
+const unsigned long TIMEOUT_LLENADO_MS = 60000UL;
+
+// Porcentaje aplicado al PWM de la bomba.
+// Es una orden electrica, no una medicion de velocidad real.
+float velocidadBombaPct = 60.0f;
+
+const float BOMBA_MIN_PCT = 0.0f;
+const float BOMBA_MAX_PCT = 100.0f;
+
+// La bomba requiere que el pulmon tenga al menos 36 grados.
+const float TEMP_MIN_BOMBA_C = 36.0f;
+
+// Bomba:
+// - Bloqueo inicial de 4 segundos desde la configuracion del PWM.
+// - Cuando esta solicitada y permitida: 6 segundos ON y 2 segundos OFF.
+const unsigned long BOMBA_BLOQUEO_INICIAL_MS = 4000UL;
+const unsigned long BOMBA_ON_MS = 6000UL;
+const unsigned long BOMBA_OFF_MS = 2000UL;
+
+// Histeresis del agitador, basada en temperatura del encamisado.
+// Enciende a partir de 30 grados.
+// Apaga a partir de 29 grados hacia abajo.
+// Entre ambos valores conserva el estado anterior si sigue habilitado.
+const float AGITADOR_ENCIENDE_C = 30.0f;
+const float AGITADOR_APAGA_C = 29.0f;
+
+// Ganancias del PID de temperatura.
+// Kp: respuesta proporcional al error actual.
+// Ki: respuesta al error acumulado.
+// Kd: respuesta al cambio del error.
+// La salida final se limita entre 0 y 100 por ciento.
+float Kp = 25.0f;
+float Ki = 0.8f;
+float Kd = 5.0f;
+
+// Limites aceptados para ajustes del PID mediante MQTT.
+const float KP_MIN = 0.0f;
+const float KP_MAX = 100.0f;
+const float KI_MIN = 0.0f;
+const float KI_MAX = 5.0f;
+const float KD_MIN = 0.0f;
+const float KD_MAX = 50.0f;
+
+// ============================================================================
+// 5. INTERVALOS Y SUPERVISION
+// ============================================================================
+
+// Estos tiempos usan millis() para programar actividades.
+// No se detiene el control durante un segundo para imprimir.
+const unsigned long CONTROL_MS = 250UL;
+const unsigned long LECTURA_NIVEL_MS = 250UL;
+
+// Edad maxima de una lectura para poder utilizarla.
+const unsigned long TEMP_MAX_EDAD_MS = 2500UL;
+const unsigned long NIVEL_MAX_EDAD_MS = 1500UL;
+
+// Preparacion de datos, resumen serial y OLED: aproximadamente cada segundo.
+// Cada actividad tiene su propio temporizador.
+const unsigned long TELEMETRIA_MS = 1000UL;
+const unsigned long SERIAL_MS = 1000UL;
+const unsigned long OLED_MS = 1000UL;
+
+// Alternancia de pantalla normal/avisos cada 3 segundos.
+const unsigned long PANTALLA_AVISO_MS = 3000UL;
+
+// Ventana de la resistencia: 2 segundos.
+// Ejemplo: 25% solicita 500 ms encendida dentro de esa ventana,
+// siempre que los permisos de seguridad se mantengan.
+const unsigned long PWM_TERMICO_MS = 2000UL;
+
+// Si se detecta una vuelta de control de mas de 1 segundo,
+// se ejecuta apagarCargasYa().
+// Esto no crea una falla enclavada por si mismo.
+const unsigned long LAZO_MAX_MS = 1000UL;
+
+// Timeout solicitado al watchdog del control.
+const uint32_t WDT_TIMEOUT_S = 4;
+
+// Numero de confirmaciones usado en ciertas decisiones.
+// Cada contador se actualiza en su propia parte del programa.
+// No representa siempre tres lecturas separadas por el mismo tiempo.
+const int DEBOUNCE = 3;
+
+// ============================================================================
+// 6. ESTADOS, FALLAS Y ESTRUCTURAS DE DATOS
+// ============================================================================
+
+enum EstadoSistema {
+  EST_INIT,     // Esperando lecturas y condiciones para continuar.
+  EST_NORMAL,   // Control normal, sujeto a todos los interbloqueos.
+  EST_RELLENO,  // Espera previa o llenado activo.
+  EST_FALLA     // Falla enclavada: necesita solicitud de rearme valida.
+};
+
+// Cada falla ocupa un bit diferente.
+// Valor decimal:
+// 0  = sin fallas.
+// 1  = lectura de temperatura no disponible tras confirmaciones.
+// 2  = lectura de nivel no disponible tras confirmaciones.
+// 4  = sobretemperatura del pulmon.
+// 8  = timeout de llenado.
+// 16 = sobretemperatura del encamisado.
+// Las fallas se pueden combinar:
+// 9 = 8 + 1 = timeout de llenado y problema de temperatura.
+// Operadores utilizados:
+// |=  agrega una falla sin borrar las otras.
+// &   comprueba si una falla esta presente.
+// &= ~ elimina una falla sin borrar las otras.
+enum Falla : uint8_t {
+  FALLA_NINGUNA = 0,
+  FALLA_SENSOR_TEMP = 1 << 0,
+  FALLA_SENSOR_NIVEL = 1 << 1,
+  FALLA_SOBRETEMP = 1 << 2,
+  FALLA_TIMEOUT_LLENADO = 1 << 3,
+  FALLA_SOBRETEMP_ENCAMISADO = 1 << 4
+};
+
+enum FaseBomba {
+  BOMBA_ESPERANDO,        // Todavia no comenzo su primer periodo ON.
+  BOMBA_ON,              // Periodo de funcionamiento.
+  BOMBA_OFF,             // Pausa temporizada.
+  BOMBA_PAUSA_SEGURIDAD   // Se perdio la solicitud o un permiso.
+};
+
+// Mensaje que el control coloca en la cola de alertas.
+// ts guarda el tiempo desde el arranque, no una fecha de calendario.
+struct Alerta {
+  char tipo[40];
+  char mensaje[80];
+  unsigned long ts;
+};
+
+// Copia de un comando MQTT para procesarlo despues en el control.
+struct ComandoRaw {
+  char json[384];
+};
+
+// Diagnostico escrito por la tarea de red.
+// Varios campos se conservan internamente aunque no se impriman:
+// codigoMqtt, errores, descartados, mutexOcupado y bytes.
+struct DiagnosticoRed {
+  bool activa = false;                 // Completo al menos una actualizacion.
+  bool wifi = false;                   // Ultimo estado observado del WiFi.
+  bool mqtt = false;                   // Ultimo estado observado de MQTT.
+  int codigoMqtt = -1;                 // Codigo interno de PubSubClient.
+  unsigned long actividadMs = 0;       // Ultima actualizacion del diagnostico.
+  unsigned long ultimoEnvioMs = 0;      // Ultima publicacion exitosa local.
+  unsigned long enviados = 0;          // Publicaciones con retorno exitoso.
+  unsigned long errores = 0;           // Publicaciones con retorno fallido.
+  unsigned long descartados = 0;       // Muestras consumidas sin MQTT.
+  unsigned long mutexOcupado = 0;      // Accesos al buffer que agotaron espera.
+  unsigned int bytes = 0;              // Longitud del ultimo payload consumido.
+  const char* resultado = "SIN_INTENTOS";
+};
+
+// ============================================================================
+// 7. OBJETOS DE RED, SENSORES Y PANTALLA
+// ============================================================================
+
+// Cliente de transporte y cliente MQTT que lo utiliza.
+// Las operaciones MQTT se realizan desde tareaRed().
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+// Identificador MQTT construido a partir del identificador del chip.
+char mqttClientId[48];
+
+// Un bus y un controlador de temperatura por sensor.
+OneWire oneWirePulmon(PIN_ONEWIRE_PULMON);
+OneWire oneWireEncamisado(PIN_ONEWIRE_ENCAMISADO);
+
+DallasTemperature sensorsPulmon(&oneWirePulmon);
+DallasTemperature sensorsEncamisado(&oneWireEncamisado);
+
+// Direcciones de los sensores encontrados al iniciar.
+DeviceAddress dirPulmon;
+DeviceAddress dirEncamisado;
+
+bool sensorPulmonEncontrado = false;
+bool sensorEncamisadoEncontrado = false;
+
+// OLED de 128 x 64 pixeles.
+// -1: no se configura un pin dedicado de reset en este constructor.
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+bool oledDisponible = false;
+
+// ============================================================================
+// 8. COMUNICACION ENTRE CONTROL Y RED
+// ============================================================================
+
+QueueHandle_t colaAlertas = NULL;
+QueueHandle_t colaComandos = NULL;
+SemaphoreHandle_t mutexTelemetria = NULL;
+TaskHandle_t tareaRedHandle = NULL;
+
+// Un solo espacio para la ultima telemetria.
+// No es una cola historica: una muestra nueva puede sustituir otra pendiente.
+// Tanto la bandera como el contenido se acceden bajo mutexTelemetria.
+char telemetriaCompartida[700];
+bool telemetriaLista = false;
+
+// diagnosticoRed: lo modifica solamente la tarea de red.
+// diagnosticoCompartido: copia que consulta el control.
+DiagnosticoRed diagnosticoRed;
+DiagnosticoRed diagnosticoCompartido;
+
+// Protege solamente la copia del diagnostico.
+// Dentro de esta seccion critica no se imprime ni se realiza trabajo de red.
+portMUX_TYPE mutexDiagnostico = portMUX_INITIALIZER_UNLOCKED;
+
+// ============================================================================
+// 9. VARIABLES DEL PROCESO
+// ============================================================================
+
+EstadoSistema estado = EST_INIT;
+
+// fallaLatente guarda las condiciones registradas.
+// codigoFalla es el conjunto de fallas que se reporta.
+// fallasAlertadas evita repetir ciertas alertas continuamente.
+uint8_t fallaLatente = FALLA_NINGUNA;
+uint8_t codigoFalla = FALLA_NINGUNA;
+uint8_t fallasAlertadas = 0;
+
+bool desviacionAlertada = false;
+
+// NAN: todavia no existe una medicion numerica util.
+// Si una lectura posterior falla, puede quedar guardado el ultimo valor;
+// por eso se comprueban tambien validez y antiguedad.
+float tempPulmon = NAN;
+float tempEncamisado = NAN;
+float nivelCm = NAN;
+
+bool tempPulmonValida = false;
+bool tempEncamisadoValida = false;
+bool nivelValida = false;
+
+// Tiempos de la ultima lectura valida de cada sensor.
+unsigned long ultimaTempPulmonValidaMs = 0;
+unsigned long ultimaTempEncamisadoValidaMs = 0;
+unsigned long ultimoNivelValidoMs = 0;
+unsigned long ultimaLecturaNivelMs = 0;
+
+// Confirmaciones y deteccion de lecturas invalidas.
+int contadorNivelBajo = 0;
+int contadorNivelSeguro = 0;
+int contadorTempInvalida = 0;
+int contadorNivelInvalido = 0;
+
+// Ventana circular de las ultimas cinco mediciones validas de nivel.
+float nivelMuestras[5];
+int nivelMuestrasN = 0;
+int nivelMuestrasIdx = 0;
+
+// Solicitudes recibidas para el modo manual.
+// Una solicitud no activa directamente un pin: pasa por el control.
+bool modoManual = false;
+bool manualBombaCmd = false;
+bool manualValvulaCmd = false;
+bool manualHeaterCmd = false;
+bool manualAgitadorCmd = false;
+bool solicitudReset = false;
+
+// Ordenes logicas despues de aplicar el control.
+bool cmdBomba = false;
+bool cmdValvula = false;
+bool cmdNiquelina = false;
+bool cmdAgitador = false;
+
+// Estados aplicados o utilizados para temporizar salidas.
+// No son confirmaciones obtenidas de sensores de los actuadores.
+bool bombaFisicaActiva = false;
+bool salidaNiquelina = false;
+bool agitadorHabilitado = false;
+bool llenadoActivo = false;
+
+// Memoria del PID.
+float pidSalidaPct = 0.0f;
+float pidIntegral = 0.0f;
+float pidErrorAnterior = 0.0f;
+unsigned long pidUltimoCalculoMs = 0;
+
+// Temporizadores de bomba, resistencia y llenado.
+FaseBomba faseBomba = BOMBA_ESPERANDO;
+
+unsigned long inicioFaseBombaMs = 0;
+unsigned long inicioBloqueoBombaMs = 0;
+unsigned long inicioVentanaPwmMs = 0;
+unsigned long inicioEsperaValvulaMs = 0;
+unsigned long inicioLlenadoMs = 0;
+
+// Temporizadores de actividades del control.
+unsigned long ultimoControlMs = 0;
+unsigned long ultimaTelemetriaMs = 0;
+unsigned long ultimoSerialMs = 0;
+unsigned long ultimoOledMs = 0;
+unsigned long ultimoComandoMs = 0;
+unsigned long ultimaIteracionMs = 0;
+
+// Temporizadores utilizados por la tarea de red.
+unsigned long ultimoWiFiIntentoMs = 0;
+unsigned long ultimoMqttIntentoMs = 0;
+
+// Resultado de la ultima preparacion de telemetria.
+// Estos dos datos se escriben y consultan desde el control.
+bool ultimaTelemetriaPreparada = false;
+const char* resultadoPreparacion = "SIN_INTENTOS";
+
+// ============================================================================
+// 10. FUNCIONES AUXILIARES
+// ============================================================================
+
+// Recorta un valor numerico a un intervalo.
+float limitar(float valor, float minimo, float maximo) {
+  if (valor < minimo) return minimo;
+  if (valor > maximo) return maximo;
+  return valor;
+}
+
+// Aplica la logica LOW=ON de valvula y agitador.
+// No se utiliza para el SSR de resistencia, cuya logica es distinta.
+void setRelay(uint8_t pin, bool encendido) {
+  digitalWrite(pin, encendido ? RELAY_ON : RELAY_OFF);
+}
+
+// Convierte el estado interno a texto para JSON, OLED y serial.
+const char* nombreEstado() {
+  switch (estado) {
+    case EST_INIT:
+      return "INIT";
+    case EST_NORMAL:
+      return "NORMAL";
+    case EST_RELLENO:
+      return "RELLENO";
+    case EST_FALLA:
+      return "FALLA";
+  }
+
+  return "?";
+}
+
+// Imprime los ocho bytes del identificador de un DS18B20.
+void imprimirDireccion(const DeviceAddress direccion) {
+  for (uint8_t indice = 0; indice < 8; indice++) {
+    if (direccion[indice] < 16) Serial.print('0');
+    Serial.print(direccion[indice], HEX);
+    if (indice < 7) Serial.print(' ');
+  }
+
+  Serial.println();
+}
+
+// ============================================================================
+// 11. DISPONIBILIDAD DE SENSORES Y PERMISOS
+// ============================================================================
+
+// Una lectura debe ser valida Y suficientemente reciente.
+bool pulmonDisponible() {
+  return tempPulmonValida &&
+         millis() - ultimaTempPulmonValidaMs <= TEMP_MAX_EDAD_MS;
+}
+
+bool encamisadoDisponible() {
+  return tempEncamisadoValida &&
+         millis() - ultimaTempEncamisadoValidaMs <= TEMP_MAX_EDAD_MS;
+}
+
+bool temperaturasDisponibles() {
+  return pulmonDisponible() && encamisadoDisponible();
+}
+
+bool nivelDisponible() {
+  return nivelValida &&
+         millis() - ultimoNivelValidoMs <= NIVEL_MAX_EDAD_MS;
+}
+
+// Revisa la dispersion de la ventana de nivel.
+// No calcula un promedio: compara la lectura maxima con la minima.
+bool nivelEstable() {
+  if (nivelMuestrasN < NIVEL_MUESTRAS) return false;
+
+  float minimo = nivelMuestras[0];
+  float maximo = nivelMuestras[0];
+
+  for (int indice = 1; indice < NIVEL_MUESTRAS; indice++) {
+    if (nivelMuestras[indice] < minimo) {
+      minimo = nivelMuestras[indice];
+    }
+
+    if (nivelMuestras[indice] > maximo) {
+      maximo = nivelMuestras[indice];
+    }
+  }
+
+  return (maximo - minimo) <= NIVEL_DISPERSION_MAX_CM;
+}
+
+// Este es el dato cargasOK del monitor.
+// Solo representa el permiso de NIVEL.
+// Todavia se necesitan otras condiciones para activar bomba o resistencia:
+// estado normal, temperaturas disponibles, valvula desactivada, etc.
+bool nivelConfirmadoParaCargas() {
+  return nivelDisponible() &&
+         nivelCm <= DISTANCIA_MAX_CARGAS_CM &&
+         contadorNivelSeguro >= NIVEL_CONFIRMACIONES_CARGAS &&
+         nivelEstable();
+}
+
+// Permisos adicionales de la valvula cuando esta en modo manual.
+bool seguridadValvulaManual() {
+  return modoManual &&
+         estado != EST_FALLA &&
+         temperaturasDisponibles() &&
+         nivelDisponible() &&
+         nivelCm > DISTANCIA_FIN_LLENADO_CM &&
+         tempPulmon < setpoint + MARGEN_SOBRETEMP_C &&
+         tempEncamisado < setpoint + MARGEN_SOBRETEMP_C &&
+         codigoFalla == FALLA_NINGUNA;
+}
+
+// Borra la memoria del controlador termico.
+void reiniciarPID() {
+  pidSalidaPct = 0.0f;
+  pidIntegral = 0.0f;
+  pidErrorAnterior = 0.0f;
+  pidUltimoCalculoMs = 0;
+}
+
+// Apagado inmediato de resistencia y bomba.
+// No cambia el estado del proceso ni apaga valvula o agitador.
+// La logica posterior puede volver a habilitar cargas si sus permisos
+// son verdaderos; esta funcion por si sola no enclava una falla.
+void apagarCargasYa() {
+  digitalWrite(PIN_RELAY_HEATER, SSR_HEATER_OFF);
+  digitalWrite(PIN_LED_NIQUELINA, LOW);
+
+  ledcWrite(PWM_CHANNEL, 0);
+  digitalWrite(PIN_LED_BOMBA, LOW);
+
+  salidaNiquelina = false;
+  bombaFisicaActiva = false;
+}
+
+// ============================================================================
+// 12. ALERTAS: EL CONTROL ENCOLA, LA RED PUBLICA
+// ============================================================================
+
+// El control no llama mqtt.publish().
+// Solo coloca el mensaje en la cola para que lo publique tareaRed().
+// Espera de cero ticks: no se bloquea si la cola esta llena.
+// El retorno no se comprueba; una alerta puede perderse si no hay espacio.
+void publicarAlerta(const char* tipo, const char* mensaje) {
+  if (colaAlertas == NULL) return;
+
+  Alerta alerta;
+
+  strlcpy(alerta.tipo, tipo, sizeof(alerta.tipo));
+  strlcpy(alerta.mensaje, mensaje, sizeof(alerta.mensaje));
+  alerta.ts = millis();
+
+  xQueueSend(colaAlertas, &alerta, 0);
+}
+
+// ============================================================================
+// 13. LECTURA DE TEMPERATURAS
+// ============================================================================
+
+// La conversion se solicita en una vuelta y se recoge en otra.
+// Durante la espera de 800 ms se sigue ejecutando el resto del control.
+void leerTemperaturas() {
+  static bool conversionPendiente = false;
+  static unsigned long inicioConversionMs = 0;
+
+  // Primera etapa: solicitar nuevas conversiones.
+  if (!conversionPendiente) {
+    if (sensorPulmonEncontrado) {
+      sensorsPulmon.requestTemperatures();
+    }
+
+    if (sensorEncamisadoEncontrado) {
+      sensorsEncamisado.requestTemperatures();
+    }
+
+    conversionPendiente = true;
+    inicioConversionMs = millis();
+    return;
+  }
+
+  // Todavia no corresponde recoger el resultado.
+  if (millis() - inicioConversionMs < 800UL) return;
+
+  conversionPendiente = false;
+
+  // Validacion y actualizacion del pulmon.
+  if (sensorPulmonEncontrado) {
+    float lectura = sensorsPulmon.getTempC(dirPulmon);
+
+    tempPulmonValida =
+        lectura != DEVICE_DISCONNECTED_C &&
+        lectura > -50.0f &&
+        lectura < 120.0f;
+
+    if (tempPulmonValida) {
+      tempPulmon = lectura;
+      ultimaTempPulmonValidaMs = millis();
+    }
+  } else {
+    tempPulmonValida = false;
+  }
+
+  // Validacion y actualizacion del encamisado.
+  if (sensorEncamisadoEncontrado) {
+    float lectura = sensorsEncamisado.getTempC(dirEncamisado);
+
+    tempEncamisadoValida =
+        lectura != DEVICE_DISCONNECTED_C &&
+        lectura > -50.0f &&
+        lectura < 120.0f;
+
+    if (tempEncamisadoValida) {
+      tempEncamisado = lectura;
+      ultimaTempEncamisadoValidaMs = millis();
+    }
+  } else {
+    tempEncamisadoValida = false;
+  }
+
+  // Se cuenta una evaluacion invalida por conversion recogida.
+  if (temperaturasDisponibles()) {
+    contadorTempInvalida = 0;
+  } else {
+    contadorTempInvalida++;
+  }
+}
+
+// ============================================================================
+// 14. LECTURA DE NIVEL
+// ============================================================================
+
+void leerNivel() {
+  // Una medicion como maximo cada 250 ms.
+  if (millis() - ultimaLecturaNivelMs < LECTURA_NIVEL_MS) return;
+
+  ultimaLecturaNivelMs = millis();
+
+  // Pulso de disparo del ultrasonico.
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(PIN_TRIG, LOW);
+
+  // Espera el pulso ECHO hasta 30000 microsegundos.
+  // Esta llamada puede bloquear brevemente, hasta ese limite.
+  unsigned long duracion = pulseIn(PIN_ECHO, HIGH, 30000UL);
+
+  // Conversion usada por este programa: microsegundos a centimetros.
+  float distancia = duracion / 58.0f;
+
+  // Sin eco o fuera de rango: invalida la lectura y pierde confirmaciones.
+  if (duracion == 0 || distancia < 2.0f || distancia > 400.0f) {
+    nivelValida = false;
+    contadorNivelSeguro = 0;
+    contadorNivelBajo = 0;
+    contadorNivelInvalido++;
+    nivelMuestrasN = 0;
+    return;
+  }
+
+  nivelCm = distancia;
+  nivelValida = true;
+  ultimoNivelValidoMs = millis();
+  contadorNivelInvalido = 0;
+
+  // Guarda la medicion en una ventana circular.
+  nivelMuestras[nivelMuestrasIdx] = distancia;
+  nivelMuestrasIdx = (nivelMuestrasIdx + 1) % NIVEL_MUESTRAS;
+
+  if (nivelMuestrasN < NIVEL_MUESTRAS) {
+    nivelMuestrasN++;
+  }
+
+  // Una sola lectura > 4 cm elimina las confirmaciones de nivel seguro.
+  if (nivelCm <= DISTANCIA_MAX_CARGAS_CM) {
+    if (contadorNivelSeguro < NIVEL_CONFIRMACIONES_CARGAS) {
+      contadorNivelSeguro++;
+    }
+  } else {
+    contadorNivelSeguro = 0;
+  }
+}
+
+// ============================================================================
+// 15. EVALUACION DE SEGURIDAD Y FALLAS
+// ============================================================================
+
+void evaluarSeguridad() {
+  // Falla de temperatura: se registra tras varias evaluaciones invalidas.
+  // El permiso de cargas puede perderse antes de alcanzar este contador.
+  if (!temperaturasDisponibles() && contadorTempInvalida >= DEBOUNCE) {
+    fallaLatente |= FALLA_SENSOR_TEMP;
+
+    if (!(fallasAlertadas & FALLA_SENSOR_TEMP)) {
+      publicarAlerta("SENSOR_TEMP_INVALIDO", "DS18B20 sin lectura valida");
+      fallasAlertadas |= FALLA_SENSOR_TEMP;
+    }
+  } else if (temperaturasDisponibles()) {
+    // Esta falla se borra cuando las temperaturas vuelven a estar disponibles.
+    fallaLatente &= ~FALLA_SENSOR_TEMP;
+    fallasAlertadas &= ~FALLA_SENSOR_TEMP;
+  }
+
+  // Falla de nivel: se registra tras varias lecturas invalidas.
+  if (!nivelDisponible() && contadorNivelInvalido >= DEBOUNCE) {
+    fallaLatente |= FALLA_SENSOR_NIVEL;
+  } else if (nivelDisponible()) {
+    fallaLatente &= ~FALLA_SENSOR_NIVEL;
+  }
+
+  // Sobretemperatura y desviacion: se evalua con ambos sensores disponibles.
+  if (temperaturasDisponibles()) {
+    float corte = setpoint + MARGEN_SOBRETEMP_C;
+
+    if (tempPulmon >= corte) {
+      fallaLatente |= FALLA_SOBRETEMP;
+
+      if (!(fallasAlertadas & FALLA_SOBRETEMP)) {
+        publicarAlerta("SOBRETEMPERATURA", "Pulmon por encima del corte");
+        fallasAlertadas |= FALLA_SOBRETEMP;
+      }
+    }
+
+    if (tempEncamisado >= corte) {
+      fallaLatente |= FALLA_SOBRETEMP_ENCAMISADO;
+
+      if (!(fallasAlertadas & FALLA_SOBRETEMP_ENCAMISADO)) {
+        publicarAlerta(
+            "SOBRETEMPERATURA_ENCAMISADO",
+            "Encamisado por encima del corte");
+
+        fallasAlertadas |= FALLA_SOBRETEMP_ENCAMISADO;
+      }
+    }
+
+    // Desviacion no significa necesariamente sobretemperatura.
+    // fabsf() toma el valor absoluto: tambien alerta si esta muy frio.
+    // Esta alerta no agrega por si misma un bit a codigoFalla.
+    bool desviacion = fabsf(tempPulmon - setpoint) >= MARGEN_SOBRETEMP_C;
+
+    if (desviacion && !desviacionAlertada) {
+      publicarAlerta("DESVIACION_TERMICA", "Desviacion termica del setpoint");
+      desviacionAlertada = true;
+    } else if (!desviacion) {
+      desviacionAlertada = false;
+    }
+  }
+
+  codigoFalla = fallaLatente;
+
+  // Solo estas fallas fuerzan el estado enclavado EST_FALLA.
+  // Las fallas de sensores afectan disponibilidad y permisos,
+  // pero no aparecen en este conjunto de fallas que enclavan.
+  const uint8_t fallasQueEnclavan =
+      FALLA_SOBRETEMP |
+      FALLA_SOBRETEMP_ENCAMISADO |
+      FALLA_TIMEOUT_LLENADO;
+
+  if (codigoFalla & fallasQueEnclavan) {
+    estado = EST_FALLA;
+  }
+}
+
+// ============================================================================
+// 16. MAQUINA DE ESTADOS Y LLENADO
+// ============================================================================
+
+// Cancela los temporizadores y la marca logica de llenado.
+// La orden del pin de valvula se actualiza despues en aplicarControl().
+void cancelarLlenado() {
+  inicioEsperaValvulaMs = 0;
+  inicioLlenadoMs = 0;
+  llenadoActivo = false;
+  contadorNivelBajo = 0;
+}
+
+void actualizarMaquinaEstados() {
+  // En FALLA solo se permite avanzar con una solicitud de reset
+  // y las condiciones de rearme indicadas.
+  // El rearme exige nivel disponible, pero no exige que ya sea <= 4 cm.
+  if (estado == EST_FALLA) {
+    if (solicitudReset &&
+        temperaturasDisponibles() &&
+        nivelDisponible() &&
+        tempPulmon < setpoint + MARGEN_REARME_C &&
+        tempEncamisado < setpoint + MARGEN_REARME_C) {
+      solicitudReset = false;
+      fallaLatente = FALLA_NINGUNA;
+      codigoFalla = FALLA_NINGUNA;
+      fallasAlertadas = FALLA_NINGUNA;
+
+      cancelarLlenado();
+      reiniciarPID();
+
+      estado = EST_INIT;
+    }
+
+    return;
+  }
+
+  // Fuera de FALLA, perder disponibilidad de sensores vuelve a INIT.
+  if (!temperaturasDisponibles() || !nivelDisponible()) {
+    cancelarLlenado();
+    reiniciarPID();
+
+    estado = EST_INIT;
+    return;
+  }
+
+  switch (estado) {
+    case EST_INIT:
+      // Entrar en NORMAL usa tres confirmaciones.
+      // El permiso de cargas sigue exigiendo cinco y estabilidad.
+      if (contadorNivelSeguro >= DEBOUNCE) {
+        estado = EST_NORMAL;
+      } else if (nivelCm > DISTANCIA_INICIO_LLENADO_CM) {
+        // Este contador se incrementa al evaluar la maquina de estados.
+        if (contadorNivelBajo < DEBOUNCE) {
+          contadorNivelBajo++;
+        }
+
+        if (contadorNivelBajo >= DEBOUNCE) {
+          estado = EST_RELLENO;
+          inicioEsperaValvulaMs = millis();
+        }
+      }
+      break;
+
+    case EST_NORMAL:
+      // Distancia grande: iniciar secuencia de llenado tras confirmaciones.
+      if (nivelCm > DISTANCIA_INICIO_LLENADO_CM) {
+        if (contadorNivelBajo < DEBOUNCE) {
+          contadorNivelBajo++;
+        }
+
+        if (contadorNivelBajo >= DEBOUNCE) {
+          estado = EST_RELLENO;
+          inicioEsperaValvulaMs = millis();
+
+          publicarAlerta(
+              "NIVEL_BAJO",
+              "Esperando retorno antes de llenar");
+        }
+      } else {
+        contadorNivelBajo = 0;
+      }
+      break;
+
+    case EST_RELLENO:
+      // Si el nivel se recupera durante la espera previa, no iniciar llenado.
+      if (!llenadoActivo &&
+          nivelCm <= DISTANCIA_INICIO_LLENADO_CM) {
+        cancelarLlenado();
+        estado = EST_NORMAL;
+        break;
+      }
+
+      // Un llenado activo termina al alcanzar distancia <= 3 cm.
+      if (llenadoActivo &&
+          nivelCm <= DISTANCIA_FIN_LLENADO_CM) {
+        cancelarLlenado();
+        estado = EST_NORMAL;
+
+        publicarAlerta(
+            "NIVEL_NORMAL",
+            "Nivel de llenado alcanzado");
+
+        break;
+      }
+
+      // Tras los 2 segundos de espera, comienza el temporizador de llenado.
+      if (!llenadoActivo &&
+          millis() - inicioEsperaValvulaMs >= ESPERA_VALVULA_MS) {
+        llenadoActivo = true;
+        inicioLlenadoMs = millis();
+      }
+
+      // Si no alcanza el nivel final dentro de 60 segundos, enclava FALLA.
+      // Esta maquina se ejecuta tambien en modo manual.
+      // El temporizador representa llenadoActivo, no una confirmacion
+      // de que la valvula se haya abierto fisicamente.
+      if (llenadoActivo &&
+          millis() - inicioLlenadoMs >= TIMEOUT_LLENADO_MS) {
+        cancelarLlenado();
+
+        fallaLatente |= FALLA_TIMEOUT_LLENADO;
+        codigoFalla = fallaLatente;
+        estado = EST_FALLA;
+
+        publicarAlerta(
+            "TIMEOUT_LLENADO",
+            "No alcanzo nivel en 60 s");
+      }
+      break;
+
+    case EST_FALLA:
+      // El manejo de FALLA esta al principio de esta funcion.
+      break;
+  }
+}
+
+// ============================================================================
+// 17. CONTROLADOR PID DE TEMPERATURA
+// ============================================================================
+
+float calcularPID(float referencia, float medida) {
+  unsigned long ahora = millis();
+
+  // Tiempo real entre calculos.
+// En el primer calculo se utiliza 1 segundo como valor inicial.
+  float intervaloSegundos =
+      pidUltimoCalculoMs == 0
+          ? 1.0f
+          : (ahora - pidUltimoCalculoMs) / 1000.0f;
+
+  if (intervaloSegundos <= 0.0f || intervaloSegundos > 5.0f) {
+    intervaloSegundos = 1.0f;
+  }
+
+  pidUltimoCalculoMs = ahora;
+
+  // Error positivo: temperatura por debajo de la referencia.
+  float error = referencia - medida;
+
+  // Acumulacion del error, limitada para restringir el crecimiento integral.
+  pidIntegral += error * intervaloSegundos;
+  pidIntegral = constrain(pidIntegral, -50.0f, 50.0f);
+
+  // Cambio del error respecto del calculo anterior.
+  float derivada = (error - pidErrorAnterior) / intervaloSegundos;
+  pidErrorAnterior = error;
+
+  float salida =
+      Kp * error +
+      Ki * pidIntegral +
+      Kd * derivada;
+
+  // El PID entrega un porcentaje; no activa directamente la resistencia.
+  return limitar(salida, 0.0f, 100.0f);
+}
+
+// ============================================================================
+// 18. SECUENCIA TEMPORIZADA DE LA BOMBA
+// ============================================================================
+
+// Devuelve true solamente durante un periodo ON permitido.
+bool bombaEnTiempo(bool solicitudBomba) {
+  unsigned long ahora = millis();
+
+  if (ahora - inicioBloqueoBombaMs < BOMBA_BLOQUEO_INICIAL_MS) {
+    return false;
+  }
+
+  // Sin solicitud o con porcentaje cero, no aplicar potencia.
+  if (!solicitudBomba || velocidadBombaPct <= 0.0f) {
+    if (faseBomba == BOMBA_ON || faseBomba == BOMBA_OFF) {
+      faseBomba = BOMBA_PAUSA_SEGURIDAD;
+    }
+
+    return false;
+  }
+
+  if (faseBomba == BOMBA_ESPERANDO) {
+    // Primer arranque permitido.
+    faseBomba = BOMBA_ON;
+    inicioFaseBombaMs = ahora;
+  } else if (faseBomba == BOMBA_PAUSA_SEGURIDAD) {
+    // Al recuperar permiso despues de una pausa, primero espera 2 segundos.
+    faseBomba = BOMBA_OFF;
+    inicioFaseBombaMs = ahora;
+  } else if (faseBomba == BOMBA_ON &&
+             ahora - inicioFaseBombaMs >= BOMBA_ON_MS) {
+    faseBomba = BOMBA_OFF;
+    inicioFaseBombaMs = ahora;
+  } else if (faseBomba == BOMBA_OFF &&
+             ahora - inicioFaseBombaMs >= BOMBA_OFF_MS) {
+    faseBomba = BOMBA_ON;
+    inicioFaseBombaMs = ahora;
+  }
+
+  return faseBomba == BOMBA_ON;
+}
+
+// ============================================================================
+// 19. DECISION DE ORDENES Y APLICACION DE VALVULA/AGITADOR
+// ============================================================================
+
+void aplicarControl() {
+  // Cada ciclo comienza con solicitudes apagadas.
+  cmdBomba = false;
+  cmdValvula = false;
+  cmdNiquelina = false;
+  cmdAgitador = false;
+  pidSalidaPct = 0.0f;
+
+  bool temperaturasOK = temperaturasDisponibles();
+  bool nivelSeguro = nivelConfirmadoParaCargas();
+
+  // Solicitudes base de bomba y resistencia, solo en NORMAL.
+  if (estado == EST_NORMAL) {
+    if (modoManual) {
+      cmdBomba = manualBombaCmd;
+      cmdNiquelina = manualHeaterCmd;
+    } else {
+      cmdBomba = true;
+      cmdNiquelina = true;
+    }
+  }
+
+  // Valvula manual: solicitud y seguridad adicional.
+  // Valvula automatica: estado RELLENO, llenado activo y nivel por recuperar.
+  if (modoManual) {
+    cmdValvula =
+        manualValvulaCmd &&
+        seguridadValvulaManual();
+  } else {
+    cmdValvula =
+        estado == EST_RELLENO &&
+        llenadoActivo &&
+        nivelDisponible() &&
+        nivelCm > DISTANCIA_FIN_LLENADO_CM;
+  }
+
+  // Permiso comun de bomba y resistencia.
+  bool cargasPermitidas =
+      estado == EST_NORMAL &&
+      temperaturasOK &&
+      nivelSeguro &&
+      !cmdValvula &&
+      estado != EST_FALLA;
+
+  // Bomba: ademas requiere temperatura minima del pulmon.
+  cmdBomba =
+      cmdBomba &&
+      cargasPermitidas &&
+      tempPulmon >= TEMP_MIN_BOMBA_C;
+
+  cmdNiquelina =
+      cmdNiquelina &&
+      cargasPermitidas;
+
+  // En automatico el agitador se solicita por defecto.
+  // En manual requiere su orden, pero conserva la histeresis termica.
+  bool agitadorSolicitado = !modoManual || manualAgitadorCmd;
+
+  if ((estado != EST_NORMAL && estado != EST_RELLENO) ||
+      !encamisadoDisponible() ||
+      !agitadorSolicitado ||
+      estado == EST_FALLA) {
+    agitadorHabilitado = false;
+  } else if (tempEncamisado >= AGITADOR_ENCIENDE_C) {
+    agitadorHabilitado = true;
+  } else if (tempEncamisado <= AGITADOR_APAGA_C) {
+    agitadorHabilitado = false;
+  }
+
+  cmdAgitador = agitadorHabilitado;
+
+  // Resistencia manual permitida: solicita 100%.
+  // Resistencia automatica permitida: utiliza el PID.
+  if (cmdNiquelina) {
+    if (modoManual) {
+      pidSalidaPct = 100.0f;
+      pidIntegral = 0.0f;
+      pidUltimoCalculoMs = 0;
+    } else {
+      pidSalidaPct = calcularPID(setpoint, tempPulmon);
+    }
+  } else {
+    reiniciarPID();
+  }
+
+  // Estas salidas se actualizan en el ciclo de control de 250 ms.
+  setRelay(PIN_RELAY_VALVE, cmdValvula);
+  setRelay(PIN_RELAY_AGITADOR, cmdAgitador);
+
+  digitalWrite(PIN_LED_VALVULA, cmdValvula ? HIGH : LOW);
+  digitalWrite(PIN_LED_AGITADOR, cmdAgitador ? HIGH : LOW);
+}
+
+// ============================================================================
+// 20. SALIDAS DE BOMBA Y RESISTENCIA: CADA VUELTA DEL LOOP
+// ============================================================================
+
+void actualizarSalidaBomba() {
+  // Vuelve a comprobar permisos antes de aplicar PWM.
+  bool habilitada =
+      cmdBomba &&
+      estado == EST_NORMAL &&
+      temperaturasDisponibles() &&
+      nivelConfirmadoParaCargas() &&
+      tempPulmon >= TEMP_MIN_BOMBA_C &&
+      !cmdValvula &&
+      estado != EST_FALLA;
+
+  bombaFisicaActiva = bombaEnTiempo(habilitada);
+
+  // Convierte porcentaje a rango de 8 bits: 0..255.
+  int duty =
+      bombaFisicaActiva
+          ? (int)roundf(velocidadBombaPct * 255.0f / 100.0f)
+          : 0;
+
+  ledcWrite(PWM_CHANNEL, constrain(duty, 0, 255));
+  digitalWrite(PIN_LED_BOMBA, bombaFisicaActiva ? HIGH : LOW);
+}
+
+void actualizarSalidaHeater() {
+  unsigned long ahora = millis();
+
+  // Inicia una ventana nueva cuando termina la anterior.
+  if (ahora - inicioVentanaPwmMs >= PWM_TERMICO_MS) {
+    inicioVentanaPwmMs = ahora;
+  }
+
+  // Tiempo ON solicitado dentro de la ventana termica.
+  unsigned long tiempoOn =
+      (unsigned long)(PWM_TERMICO_MS * pidSalidaPct / 100.0f);
+
+  // Verificacion adicional de permisos y limites de temperatura.
+  bool habilitada =
+      cmdNiquelina &&
+      estado == EST_NORMAL &&
+      temperaturasDisponibles() &&
+      nivelConfirmadoParaCargas() &&
+      tempPulmon < setpoint + MARGEN_SOBRETEMP_C &&
+      tempEncamisado < setpoint + MARGEN_SOBRETEMP_C &&
+      !cmdValvula &&
+      estado != EST_FALLA;
+
+  salidaNiquelina =
+      habilitada &&
+      ahora - inicioVentanaPwmMs < tiempoOn;
+
+  digitalWrite(
+      PIN_RELAY_HEATER,
+      salidaNiquelina ? SSR_HEATER_ON : SSR_HEATER_OFF);
+
+  digitalWrite(
+      PIN_LED_NIQUELINA,
+      salidaNiquelina ? HIGH : LOW);
+}
+
+// Comprobacion general que utiliza loop() para el apagado inmediato.
+bool cargasPermitidasAhora() {
+  return estado == EST_NORMAL &&
+         temperaturasDisponibles() &&
+         nivelConfirmadoParaCargas() &&
+         !cmdValvula;
+}
+
+// ============================================================================
+// 21. PREPARACION DE TELEMETRIA
+// ============================================================================
+
+// Construye el JSON y lo deja disponible para la tarea de red.
+// Esta funcion no publica directamente por MQTT.
+void prepararTelemetria() {
+  char payload[700];
+
+  // Los nombres de campos forman el contrato con quien recibe los datos.
+  // Si un sensor no esta disponible se transmite 0 en su valor.
+  // Quien lo recibe debe consultar tambien las banderas de validez.
+  // temp_valida representa la disponibilidad de AMBOS sensores.
+  int longitud = snprintf(
+      payload, sizeof(payload),
+      "{\"estado\":\"%s\","
+      "\"temp_pulmon\":%.2f,"
+      "\"temp_encamisado\":%.2f,"
+      "\"nivel_cm\":%.1f,"
+      "\"pid_pct\":%.1f,"
+      "\"setpoint\":%.1f,"
+      "\"modo_manual\":%s,"
+      "\"bomba\":%s,"
+      "\"velocidad_bomba\":%.0f,"
+      "\"valvula\":%s,"
+      "\"agitador\":%s,"
+      "\"niquelina\":%s,"
+      "\"kp\":%.2f,"
+      "\"ki\":%.2f,"
+      "\"kd\":%.2f,"
+      "\"temp_valida\":%s,"
+      "\"nivel_valida\":%s,"
+      "\"cargas_ok\":%s,"
+      "\"codigo_falla\":%u}",
+      nombreEstado(),
+      pulmonDisponible() ? tempPulmon : 0.0f,
+      encamisadoDisponible() ? tempEncamisado : 0.0f,
+      nivelDisponible() ? nivelCm : 0.0f,
+      pidSalidaPct,
+      setpoint,
+      modoManual ? "true" : "false",
+      bombaFisicaActiva ? "true" : "false",
+      velocidadBombaPct,
+      cmdValvula ? "true" : "false",
+      cmdAgitador ? "true" : "false",
+      salidaNiquelina ? "true" : "false",
+      Kp,
+      Ki,
+      Kd,
+      temperaturasDisponibles() ? "true" : "false",
+      nivelDisponible() ? "true" : "false",
+      nivelConfirmadoParaCargas() ? "true" : "false",
+      (unsigned int)codigoFalla);
+
+  ultimaTelemetriaPreparada = false;
+  resultadoPreparacion = "MUTEX_OCUPADO";
+
+  // No permitir un JSON truncado por falta de espacio.
+  if (longitud < 0 || (size_t)longitud >= sizeof(payload)) {
+    resultadoPreparacion = "ERROR_TAMANO_JSON";
+    return;
+  }
+
+  if (mutexTelemetria == NULL) {
+    resultadoPreparacion = "SIN_MUTEX";
+    return;
+  }
+
+  // Espera breve para acceder al buffer sin frenar demasiado el control.
+  if (xSemaphoreTake(mutexTelemetria, pdMS_TO_TICKS(5)) == pdTRUE) {
+    strlcpy(
+        telemetriaCompartida,
+        payload,
+        sizeof(telemetriaCompartida));
+
+    telemetriaLista = true;
+    ultimaTelemetriaPreparada = true;
+    resultadoPreparacion = "OK";
+
+    xSemaphoreGive(mutexTelemetria);
+  }
+}
+
+// ============================================================================
+// 22. DIAGNOSTICO DEL MONITOR SERIAL
+// ============================================================================
+
+// loop() llama esta funcion aproximadamente una vez por segundo.
+// PROCESO: mediciones y estado actual del control.
+// RED: ultima conexion observada por tareaRed().
+// DATOS: preparacion actual y ultimo resultado de publicacion.
+// ENVIOS: contador de publicaciones exitosas locales.
+// TIEMPOS: antiguedad del ultimo envio y del diagnostico de red.
+// La muestra recien preparada y el ultimo envio terminado pueden ser distintos.
+void imprimirDiagnosticoSerial() {
+  DiagnosticoRed resumen;
+
+  // Obtiene una copia consistente sin imprimir dentro de la seccion critica.
+  portENTER_CRITICAL(&mutexDiagnostico);
+  resumen = diagnosticoCompartido;
+  portEXIT_CRITICAL(&mutexDiagnostico);
+
+  unsigned long ahora = millis();
+  unsigned long edadRed = ahora - resumen.actividadMs;
+
+  char edadEnvio[24];
+
+  if (resumen.enviados == 0) {
+    strlcpy(edadEnvio, "NUNCA", sizeof(edadEnvio));
+  } else {
+    snprintf(
+        edadEnvio,
+        sizeof(edadEnvio),
+        "%lu ms",
+        ahora - resumen.ultimoEnvioMs);
+  }
+
+  // tarea_red=OK solo significa diagnostico reciente.
+  // No garantiza WiFi, MQTT ni recepcion del dashboard.
+  const char* actividadRed =
+      !resumen.activa
+          ? "SIN_ACTIVIDAD"
+          : (edadRed > 5000UL ? "REVISAR" : "OK");
+
+  // -99 y -1 son marcadores de no disponibilidad en el serial.
+  // No representan temperaturas o distancias reales.
+  // falla muestra solo el numero; su significado esta documentado
+  // en enum Falla. No se imprime una descripcion textual aqui.
+  Serial.printf(
+      "[PROCESO] estado=%s falla=%u "
+      "pulmon=%.1f encam=%.1f nivel=%.1f "
+      "cargasOK=%d heater=%d bomba=%d valvula=%d manual=%d\n"
+      "   [RED] WIFI=%s | MQTT=%s\n"
+      "   [DATOS] preparada=%s preparacion=%s ultimo_resultado=%s\n"
+      "   [ENVIOS] OK=%lu\n"
+      "   [TIEMPOS] ultimo_OK_hace=%s "
+      "actividad_red_hace=%lu ms tarea_red=%s\n",
+      nombreEstado(),
+      (unsigned int)codigoFalla,
+      pulmonDisponible() ? tempPulmon : -99.0f,
+      encamisadoDisponible() ? tempEncamisado : -99.0f,
+      nivelDisponible() ? nivelCm : -1.0f,
+      nivelConfirmadoParaCargas() ? 1 : 0,
+      salidaNiquelina ? 1 : 0,
+      bombaFisicaActiva ? 1 : 0,
+      cmdValvula ? 1 : 0,
+      modoManual ? 1 : 0,
+      resumen.wifi ? "CONECTADO" : "DESCONECTADO",
+      resumen.mqtt ? "CONECTADO" : "DESCONECTADO",
+      ultimaTelemetriaPreparada ? "SI" : "NO",
+      resultadoPreparacion,
+      resumen.resultado,
+      resumen.enviados,
+      edadEnvio,
+      edadRed,
+      actividadRed);
+
+  // Muestra un aviso prioritario, no todos simultaneamente.
+  // Si el diagnostico envejece, WiFi/MQTT pueden ser datos antiguos.
+  if (!resumen.activa) {
+    Serial.println("   [AVISO] La tarea de red aun no reporta actividad");
+  } else if (edadRed > 5000UL) {
+    Serial.println("   [AVISO] Diagnostico de red antiguo: revisar tarea de red");
+  } else if (!resumen.wifi) {
+    Serial.println("   [AVISO] Sin conexion WiFi");
+  } else if (!resumen.mqtt) {
+    Serial.println("   [AVISO] Sin conexion MQTT");
+  } else if (strcmp(resumen.resultado, "ERROR_PUBLICACION") == 0) {
+    Serial.println("   [AVISO] Fallo el ultimo intento de publicar telemetria");
+  }
+
+  Serial.println();
+}
+
+// ============================================================================
+// 23. INTERPRETACION DE COMANDOS MQTT EN EL CONTROL
+// ============================================================================
+
+// Ejemplos del formato esperado:
+// {"cmd":"setpoint","valor":48}
+// {"cmd":"modo","valor":"manual"}
+// {"cmd":"modo","valor":"automatico"}
+// {"cmd":"bomba","valor":true}
+// {"cmd":"valvula","valor":false}
+// {"cmd":"niquelina","valor":true}
+// {"cmd":"agitador","valor":true}
+// {"cmd":"velocidad_bomba","valor":60}
+// {"cmd":"pid","kp":25,"ki":0.8,"kd":5}
+// {"cmd":"reset_falla"}
+// Los comandos de actuadores guardan solicitudes.
+// Sus permisos y aplicacion se deciden posteriormente en el control.
+void ejecutarComando(const char* texto) {
+  StaticJsonDocument<384> doc;
+
+  DeserializationError error = deserializeJson(doc, texto);
+
+  if (error) {
+    publicarAlerta("COMANDO_INVALIDO", "JSON mal formado");
+    return;
+  }
+
+  const char* comando = doc["cmd"];
+
+  if (!comando) return;
+
+  // Marca recepcion de un JSON con campo cmd, aunque el comando sea desconocido.
+  ultimoComandoMs = millis();
+
+  if (strcmp(comando, "setpoint") == 0 &&
+      doc.containsKey("valor")) {
+    setpoint = limitar(
+        doc["valor"].as<float>(),
+        SETPOINT_MIN,
+        SETPOINT_MAX);
+
+    reiniciarPID();
+  } else if (strcmp(comando, "modo") == 0 &&
+             doc.containsKey("valor")) {
+    const char* valor = doc["valor"];
+
+    // Solo el texto exacto "manual" activa el modo manual.
+    modoManual = valor && strcmp(valor, "manual") == 0;
+
+    if (!modoManual) {
+      manualBombaCmd = false;
+      manualValvulaCmd = false;
+      manualHeaterCmd = false;
+      manualAgitadorCmd = false;
+    }
+
+    reiniciarPID();
+  } else if (strcmp(comando, "bomba") == 0 &&
+             doc.containsKey("valor")) {
+    manualBombaCmd = doc["valor"].as<bool>();
+  } else if (strcmp(comando, "valvula") == 0 &&
+             doc.containsKey("valor")) {
+    manualValvulaCmd = doc["valor"].as<bool>();
+  } else if (strcmp(comando, "niquelina") == 0 &&
+             doc.containsKey("valor")) {
+    manualHeaterCmd = doc["valor"].as<bool>();
+  } else if (strcmp(comando, "agitador") == 0 &&
+             doc.containsKey("valor")) {
+    manualAgitadorCmd = doc["valor"].as<bool>();
+  } else if (strcmp(comando, "velocidad_bomba") == 0 &&
+             doc.containsKey("valor")) {
+    velocidadBombaPct = limitar(
+        doc["valor"].as<float>(),
+        BOMBA_MIN_PCT,
+        BOMBA_MAX_PCT);
+  } else if (strcmp(comando, "pid") == 0) {
+    if (doc.containsKey("kp")) {
+      Kp = limitar(doc["kp"].as<float>(), KP_MIN, KP_MAX);
+    }
+
+    if (doc.containsKey("ki")) {
+      Ki = limitar(doc["ki"].as<float>(), KI_MIN, KI_MAX);
+    }
+
+    if (doc.containsKey("kd")) {
+      Kd = limitar(doc["kd"].as<float>(), KD_MIN, KD_MAX);
+    }
+
+    reiniciarPID();
+  } else if (strcmp(comando, "reset_falla") == 0) {
+    // Solicita rearme; no cambia directamente el estado.
+    // actualizarMaquinaEstados() vuelve a comprobar las condiciones.
+    if (temperaturasDisponibles() &&
+        nivelDisponible() &&
+        tempPulmon < setpoint + MARGEN_REARME_C &&
+        tempEncamisado < setpoint + MARGEN_REARME_C) {
+      solicitudReset = true;
+
+      publicarAlerta(
+          "REARME_SOLICITADO",
+          "Revisando condiciones");
+    } else {
+      publicarAlerta(
+          "REARME_RECHAZADO",
+          "Condiciones inseguras");
+    }
+  }
+}
+
+// Consume los comandos que la tarea de red dejo en la cola.
+void procesarComandos() {
+  ComandoRaw comando;
+
+  while (xQueueReceive(colaComandos, &comando, 0) == pdTRUE) {
+    ejecutarComando(comando.json);
+  }
+}
+
+// ============================================================================
+// 24. MANTENIMIENTO DE CONEXIONES: SOLO TAREA DE RED
+// ============================================================================
+
+void mantenerConexiones() {
+  // Sin WiFi no se intenta conectar MQTT.
+  // Se vuelve a solicitar conexion WiFi cada 10 segundos.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - ultimoWiFiIntentoMs >= 10000UL) {
+      ultimoWiFiIntentoMs = millis();
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+
+    return;
+  }
+
+  // Con WiFi y sin MQTT, intentar conectar cada 5 segundos.
+  // La llamada connect() puede esperar; por eso se hace en la tarea de red.
+  if (!mqtt.connected() &&
+      millis() - ultimoMqttIntentoMs >= 5000UL) {
+    ultimoMqttIntentoMs = millis();
+
+    if (mqtt.connect(mqttClientId)) {
+      Serial.println("[EVENTO RED] MQTT conectado");
+
+      // Se renueva la suscripcion despues de cada conexion exitosa.
+      if (!mqtt.subscribe(TOPIC_COMANDOS)) {
+        Serial.println(
+            "[EVENTO RED] No se pudo enviar la suscripcion a comandos");
+      }
+    } else {
+      Serial.println("[EVENTO RED] Fallo el intento de conexion MQTT");
+    }
+  }
+}
+
+// Callback ejecutado al procesar mensajes MQTT.
+// No maneja directamente las salidas del tanque.
+void alRecibirMensaje(
+    char* topic,
+    byte* payload,
+    unsigned int length) {
+  ComandoRaw comando;
+
+  // Rechaza mensajes vacios o que no caben con su terminador.
+  if (length == 0 || length >= sizeof(comando.json)) return;
+
+  memcpy(comando.json, payload, length);
+  comando.json[length] = '\0';
+
+  // Sin espera: si la cola esta llena, el comando puede perderse.
+  // El parametro topic no se utiliza para filtrar en esta funcion.
+  xQueueSend(colaComandos, &comando, 0);
+}
+
+// ============================================================================
+// 25. PUBLICACION DE ALERTAS Y TELEMETRIA
+// ============================================================================
+
+void publicarAlertasPendientes() {
+  Alerta alerta;
+
+  while (xQueueReceive(colaAlertas, &alerta, 0) == pdTRUE) {
+    // La alerta ya fue retirada de la cola.
+    // Si no hay MQTT, se descarta sin reintento.
+    if (!mqtt.connected()) continue;
+
+    char payload[200];
+
+    snprintf(
+        payload,
+        sizeof(payload),
+        "{\"tipo\":\"%s\",\"mensaje\":\"%s\",\"ts_ms\":%lu}",
+        alerta.tipo,
+        alerta.mensaje,
+        alerta.ts);
+
+    // El resultado de publicar alertas no se cuenta en [ENVIOS].
+    // Aqui no se comprueba el retorno de publish().
+    mqtt.publish(TOPIC_ALERTAS, payload);
+  }
+}
+
+void publicarTelemetriaPendiente() {
+  char copia[700];
+
+  // Espera hasta 20 ms por el buffer compartido.
+  if (xSemaphoreTake(
+          mutexTelemetria,
+          pdMS_TO_TICKS(20)) != pdTRUE) {
+    diagnosticoRed.mutexOcupado++;
+    return;
+  }
+
+  // No hay una muestra nueva: liberar el mutex y terminar.
+  if (!telemetriaLista) {
+    xSemaphoreGive(mutexTelemetria);
+    return;
+  }
+
+  strlcpy(copia, telemetriaCompartida, sizeof(copia));
+
+  // La muestra se marca consumida ANTES del intento de envio.
+  // Esta version no conserva muestras fallidas para reenviarlas.
+  telemetriaLista = false;
+
+  // La operacion de red ocurre fuera del mutex.
+  xSemaphoreGive(mutexTelemetria);
+
+  diagnosticoRed.bytes = (unsigned int)strlen(copia);
+
+  if (!mqtt.connected()) {
+    diagnosticoRed.descartados++;
+    diagnosticoRed.resultado = "DESCARTADO_SIN_MQTT";
+    return;
+  }
+
+  bool enviado = mqtt.publish(TOPIC_TELEMETRIA, copia);
+
+  if (enviado) {
+    diagnosticoRed.enviados++;
+    diagnosticoRed.ultimoEnvioMs = millis();
+
+    // Exito LOCAL de la publicacion.
+    // No es una confirmacion del dashboard.
+    diagnosticoRed.resultado = "OK_LOCAL";
+  } else {
+    diagnosticoRed.errores++;
+    diagnosticoRed.resultado = "ERROR_PUBLICACION";
+  }
+}
+
+// ============================================================================
+// 26. TAREA DEDICADA DE COMUNICACIONES
+// ============================================================================
+
+void tareaRed(void* parametro) {
+  for (;;) {
+    mantenerConexiones();
+
+    // Procesa recepcion de mensajes y mantenimiento de la sesion MQTT.
+    if (mqtt.connected()) {
+      mqtt.loop();
+    }
+
+    publicarAlertasPendientes();
+    publicarTelemetriaPendiente();
+
+    // Diagnostico al finalizar esta vuelta.
+    // Si alguna operacion anterior tarda, esta marca se actualiza mas tarde.
+    diagnosticoRed.activa = true;
+    diagnosticoRed.wifi = WiFi.status() == WL_CONNECTED;
+    diagnosticoRed.mqtt = mqtt.connected();
+    diagnosticoRed.codigoMqtt = mqtt.state();
+    diagnosticoRed.actividadMs = millis();
+
+    // Publica una copia consistente para el monitor del control.
+    portENTER_CRITICAL(&mutexDiagnostico);
+    diagnosticoCompartido = diagnosticoRed;
+    portEXIT_CRITICAL(&mutexDiagnostico);
+
+    // Cede tiempo a otras tareas. No imprime cada 10 ms.
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// ============================================================================
+// 27. PANTALLA OLED
+// ============================================================================
+
+// Dibuja el contenido normal en el buffer de la pantalla.
+// El envio a la OLED se realiza despues mediante display.display().
+void mostrarPantallaOriginal() {
+  display.setCursor(0, 0);
+  display.print("Estado: ");
+  display.println(nombreEstado());
+
+  display.setCursor(0, 10);
+  display.print("Modo: ");
+  display.println(modoManual ? "MANUAL" : "AUTOMATICO");
+
+  display.setCursor(0, 20);
+  display.print("Pulmon: ");
+
+  if (pulmonDisponible()) {
+    display.print(tempPulmon, 1);
+  } else {
+    display.print("--");
+  }
+
+  display.println(" C");
+
+  display.setCursor(0, 30);
+  display.print("Encam: ");
+
+  if (encamisadoDisponible()) {
+    display.print(tempEncamisado, 1);
+  } else {
+    display.print("--");
+  }
+
+  display.println(" C");
+
+  display.setCursor(0, 40);
+  display.print("Nivel: ");
+
+  if (nivelDisponible()) {
+    display.print(nivelCm, 1);
+  } else {
+    display.print("--");
+  }
+
+  display.println(" cm");
+
+  display.setCursor(0, 52);
+  display.print("SP:");
+  display.print(setpoint, 1);
+  display.print(" B:");
+  display.print((int)velocidadBombaPct);
+  display.print("%");
+}
+
+// Avisos del proceso. No muestra diagnostico MQTT.
+void mostrarPantallaAviso() {
+  display.setCursor(0, 0);
+
+  if (estado == EST_FALLA) {
+    display.println("FALLA:");
+
+    // Comprueba cada bit: puede mostrar mas de una causa.
+    if (codigoFalla & FALLA_SOBRETEMP) {
+      display.println("SOBRETEMP PULMON");
+    }
+
+    if (codigoFalla & FALLA_SOBRETEMP_ENCAMISADO) {
+      display.println("SOBRETEMP ENCAM");
+    }
+
+    if (codigoFalla & FALLA_TIMEOUT_LLENADO) {
+      display.println("TIMEOUT LLENADO");
+    }
+
+    return;
+  }
+
+  if (!nivelDisponible()) {
+    display.println("NIVEL SIN LECTURA");
+    display.println("Valvula: OFF");
+    display.println("Bomba: OFF");
+    display.println("Resistencia: OFF");
+  } else if (!temperaturasDisponibles()) {
+    display.println("SENSOR TEMP SIN");
+    display.println("LECTURA");
+  }
+}
+
+void actualizarOLED() {
+  if (!oledDisponible) return;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  bool hayAviso =
+      estado == EST_FALLA ||
+      !nivelDisponible() ||
+      !temperaturasDisponibles();
+
+  // Alterna normal/aviso en bloques de 3 segundos.
+  bool mostrarAviso =
+      hayAviso &&
+      ((millis() / PANTALLA_AVISO_MS) % 2UL) == 1UL;
+
+  if (mostrarAviso) {
+    mostrarPantallaAviso();
+  } else {
+    mostrarPantallaOriginal();
+  }
+
+  display.display();
+}
+
+// ============================================================================
+// 28. BUZZER
+// ============================================================================
+
+void actualizarBuzzer() {
+  // En FALLA o sin nivel disponible, alterna cada 300 ms.
+  if (estado == EST_FALLA || !nivelDisponible()) {
+    bool encendido = ((millis() / 300UL) % 2UL) == 0;
+
+    digitalWrite(PIN_BUZZER, encendido ? HIGH : LOW);
+    return;
+  }
+
+  // Senal corta asociada a un comando reciente.
+  // ultimoComandoMs inicia en cero, asi que esta expresion tambien
+  // puede resultar verdadera al comienzo del arranque.
+  digitalWrite(
+      PIN_BUZZER,
+      millis() - ultimoComandoMs < 150UL ? HIGH : LOW);
+}
+
+// ============================================================================
+// 29. SETUP: SE EJECUTA UNA VEZ AL ARRANCAR
+// ============================================================================
+
+void setup() {
+  // Primero configurar niveles de apagado y despues habilitar salidas.
+  // Se repite el nivel apagado tras configurar cada pin.
+  digitalWrite(PIN_RELAY_HEATER, SSR_HEATER_OFF);
+  pinMode(PIN_RELAY_HEATER, OUTPUT);
+  digitalWrite(PIN_RELAY_HEATER, SSR_HEATER_OFF);
+
+  digitalWrite(PIN_RELAY_VALVE, RELAY_OFF);
+  pinMode(PIN_RELAY_VALVE, OUTPUT);
+  digitalWrite(PIN_RELAY_VALVE, RELAY_OFF);
+
+  digitalWrite(PIN_RELAY_AGITADOR, RELAY_OFF);
+  pinMode(PIN_RELAY_AGITADOR, OUTPUT);
+  digitalWrite(PIN_RELAY_AGITADOR, RELAY_OFF);
+
+  digitalWrite(PIN_PUMP_PWM, LOW);
+  pinMode(PIN_PUMP_PWM, OUTPUT);
+  digitalWrite(PIN_PUMP_PWM, LOW);
+
+  // El monitor serial debe configurarse a 115200 baudios.
+  Serial.begin(115200);
+  Serial.println();
+
+  Serial.println("Iniciando tanque de chocolate v3 - diagnostico");
+  Serial.println("Red en nucleo 0, control en nucleo 1");
+  Serial.println("Resumen del monitor serial cada 1 segundo");
+  Serial.println("Bomba: 4 s de bloqueo inicial, luego 6 s ON / 2 s OFF");
+  Serial.println("Valvula: espera automatica de 2 s");
+  Serial.println("Cargas: 5 lecturas <= 4 cm y estables");
+  Serial.println("OK_LOCAL no confirma recepcion en el dashboard");
+  Serial.println();
+
+  // Sensor de nivel e indicadores.
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  pinMode(PIN_LED_WIFI, OUTPUT);
+  pinMode(PIN_LED_BOMBA, OUTPUT);
+  pinMode(PIN_LED_NIQUELINA, OUTPUT);
+  pinMode(PIN_LED_VALVULA, OUTPUT);
+  pinMode(PIN_LED_AGITADOR, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  digitalWrite(PIN_LED_WIFI, LOW);
+  digitalWrite(PIN_LED_BOMBA, LOW);
+  digitalWrite(PIN_LED_NIQUELINA, LOW);
+  digitalWrite(PIN_LED_VALVULA, LOW);
+  digitalWrite(PIN_LED_AGITADOR, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  // PWM de bomba: conserva las llamadas de la version original.
+  ledcSetup(PWM_CHANNEL, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttachPin(PIN_PUMP_PWM, PWM_CHANNEL);
+  ledcWrite(PWM_CHANNEL, 0);
+
+  inicioBloqueoBombaMs = millis();
+
+  // Recursos compartidos: se crean antes de iniciar tareaRed().
+  colaAlertas = xQueueCreate(10, sizeof(Alerta));
+  colaComandos = xQueueCreate(8, sizeof(ComandoRaw));
+  mutexTelemetria = xSemaphoreCreateMutex();
+
+  // Si faltan recursos indispensables, detener el arranque.
+  if (colaAlertas == NULL ||
+      colaComandos == NULL ||
+      mutexTelemetria == NULL) {
+    Serial.println(
+        "[ERROR INIT] No se pudieron crear colas o mutex. Cargas apagadas.");
+
+    apagarCargasYa();
+
+    for (;;) {
+      delay(1000);
+    }
+  }
+
+  // Pantalla OLED. Si no inicia, el programa continua sin pantalla.
+  Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL);
+
+  oledDisponible = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  if (oledDisponible) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Tanque chocolate");
+    display.println("Iniciando...");
+    display.display();
+  }
+
+  // Inicializa buses y configura conversiones sin esperar en la solicitud.
+  sensorsPulmon.begin();
+  sensorsEncamisado.begin();
+
+  sensorsPulmon.setWaitForConversion(false);
+  sensorsEncamisado.setWaitForConversion(false);
+
+  // Selecciona el primer sensor encontrado en cada bus.
+  // La busqueda se hace aqui al arrancar, no continuamente en loop().
+  sensorPulmonEncontrado =
+      sensorsPulmon.getDeviceCount() >= 1 &&
+      sensorsPulmon.getAddress(dirPulmon, 0);
+
+  sensorEncamisadoEncontrado =
+      sensorsEncamisado.getDeviceCount() >= 1 &&
+      sensorsEncamisado.getAddress(dirEncamisado, 0);
+
+  if (sensorPulmonEncontrado) {
+    Serial.print("DS18B20 pulmon: ");
+    imprimirDireccion(dirPulmon);
+  } else {
+    Serial.println("Falta DS18B20 pulmon");
+  }
+
+  if (sensorEncamisadoEncontrado) {
+    Serial.print("DS18B20 encamisado: ");
+    imprimirDireccion(dirEncamisado);
+  } else {
+    Serial.println("Falta DS18B20 encamisado");
+  }
+
+  // Identificador MQTT basado en el chip.
+  uint64_t chipId = ESP.getEfuseMac();
+
+  snprintf(
+      mqttClientId,
+      sizeof(mqttClientId),
+      "esp32-choco-%04X%08X",
+      (uint16_t)(chipId >> 32),
+      (uint32_t)chipId);
+
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(alRecibirMensaje);
+
+  // Buffer MQTT para alojar contenido y cabecera del mensaje.
+  if (!mqtt.setBufferSize(768)) {
+    Serial.println(
+        "[AVISO MQTT] No se pudo ampliar el buffer a 768 bytes");
+  }
+
+  // Timeout de socket y mantenimiento de sesion.
+  // No deben interpretarse como un limite total de toda operacion de red.
+  mqtt.setSocketTimeout(3);
+  mqtt.setKeepAlive(30);
+
+  // WiFi en modo cliente.
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  ultimoWiFiIntentoMs = millis();
+
+  estado = EST_INIT;
+
+  // Tarea de red fijada al nucleo 0 y con prioridad 1.
+  BaseType_t resultadoTarea = xTaskCreatePinnedToCore(
+      tareaRed,
+      "tareaRed",
+      10240,
+      NULL,
+      1,
+      &tareaRedHandle,
+      0);
+
+  // Si no se crea la tarea, el control continua,
+  // pero no habra publicaciones ni recepcion de comandos.
+  if (resultadoTarea != pdPASS) {
+    Serial.println(
+        "[ERROR RED] No se pudo crear la tarea de red");
+  }
+
+  // Watchdog del lazo principal: conserva la API del programa original.
+  // Los retornos no se comprueban en esta version.
+  // tareaRed() no se registra explicitamente aqui en el watchdog.
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
+
+  ultimaIteracionMs = millis();
+  ultimoSerialMs = millis();
+}
+
+// ============================================================================
+// 30. LOOP: CONTROL CONTINUO DEL TANQUE
+// ============================================================================
+
+void loop() {
+  // Informa al watchdog que el lazo principal sigue ejecutandose.
+  esp_task_wdt_reset();
+
+  unsigned long ahora = millis();
+
+  // Detecta una vuelta anterior demasiado lenta y ejecuta corte inmediato.
+  // No enclava FALLA; mas abajo se reevaluan y aplican salidas.
+  if (ahora - ultimaIteracionMs > LAZO_MAX_MS) {
+    apagarCargasYa();
+
+    Serial.println(
+        "AVISO: lazo de control lento, cargas apagadas");
+  }
+
+  ultimaIteracionMs = ahora;
+
+  // Entradas: comandos, temperaturas y nivel.
+  procesarComandos();
+  leerTemperaturas();
+  leerNivel();
+
+  ahora = millis();
+
+  // Decisiones de control aproximadamente cada 250 ms.
+  // El orden es importante:
+  // 1. Fallas y seguridad.
+  // 2. Estado del proceso.
+  // 3. Ordenes de actuadores.
+  if (ahora - ultimoControlMs >= CONTROL_MS) {
+    ultimoControlMs = ahora;
+
+    evaluarSeguridad();
+    actualizarMaquinaEstados();
+    aplicarControl();
+  }
+
+  // Comprobacion general de cargas en cada vuelta.
+  if (!cargasPermitidasAhora()) {
+    apagarCargasYa();
+  }
+
+  // Estas funciones vuelven a comprobar sus permisos antes de aplicar salidas.
+  actualizarSalidaBomba();
+  actualizarSalidaHeater();
+  actualizarBuzzer();
+
+  // El LED WiFi solo indica conexion WiFi, no MQTT ni recepcion del dashboard.
+  digitalWrite(
+      PIN_LED_WIFI,
+      WiFi.status() == WL_CONNECTED ? HIGH : LOW);
+
+  // Actualizacion de pantalla aproximadamente cada segundo.
+  if (ahora - ultimoOledMs >= OLED_MS) {
+    ultimoOledMs = ahora;
+    actualizarOLED();
+  }
+
+  ahora = millis();
+
+  // Preparar una nueva muestra aproximadamente cada segundo.
+  // La tarea de red la publicara cuando pueda procesarla.
+  if (ahora - ultimaTelemetriaMs >= TELEMETRIA_MS) {
+    ultimaTelemetriaMs = ahora;
+    prepararTelemetria();
+  }
+
+  ahora = millis();
+
+  // Resumen serial aproximadamente cada segundo.
+  // Los eventos de conexion, arranque y seguridad pueden imprimirse aparte.
+  if (ahora - ultimoSerialMs >= SERIAL_MS) {
+    ultimoSerialMs = ahora;
+    imprimirDiagnosticoSerial();
+  }
+
+  // Pausa breve. No se utiliza delay(1000) en el funcionamiento normal.
+  delay(1);
+}
