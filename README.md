@@ -1,6 +1,19 @@
 # Sistema de Calefacción - Tanque de Chocolate
 
-Sistema mecatrónico que mantiene el chocolate a una temperatura de 44°C ± 1 °C, el agua viene de un tanque pulmón donde calienta a 48°C ± 1 °C. Controlado por un ESP32 con PID + SSR, y supervisado desde Node-RED vía MQTT.
+Sistema mecatrónico que mantiene el chocolate a 44 °C ± 1 °C dentro
+de un tanque encamisado. El calor se transfiere desde un tanque pulmón
+de agua, que se calienta a 48 °C ± 1 °C mediante una niquelina
+(resistencia) gobernada por un control PID a través de un relé de
+estado sólido (SSR).
+
+El agua caliente del pulmón circula hacia el encamisado del tanque de
+chocolate mediante una bomba de recirculación controlada por PWM,
+manteniendo así la temperatura del chocolate por transferencia térmica
+indirecta. El nivel del agua en el circuito se regula con una válvula
+de llenado automática.
+
+Todo el sistema es controlado por un ESP32 y supervisado en tiempo real
+desde un dashboard de Node-RED vía MQTT.
 
 ## 📁 Contenido del repositorio
 
